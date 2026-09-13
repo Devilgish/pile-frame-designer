@@ -1,11 +1,14 @@
-"""Проект каркаса: прямоугольный план на сваях → сваи, элементы каркаса, проверка."""
+"""Проект каркаса: план на сваях → сваи, элементы каркаса, проверка."""
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from shapely.geometry import LineString
 
 from pile_frame.beam import BeamCheck, BeamLoad, check_beam
+from pile_frame.contour import Contour, Point
 from pile_frame.materials import C245
 from pile_frame.sections import Section, TUBE_120x60x4, TUBE_120x120x5
 
@@ -21,16 +24,32 @@ def gamma_f_live(live_load_kpa: float) -> float:
     return 1.3 if live_load_kpa < 2.0 else 1.2
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Project:
-    """Исходные данные: размеры плана, мм; шаг свай, мм; временная нагрузка на пол, кПа."""
+    """Исходные данные проекта.
 
-    width_mm: float
-    length_mm: float
+    План задаётся контуром или, для прямоугольника, шириной и длиной, мм. Сваи можно
+    передать явно; если их нет, они расставляются автоматически с шагом ``pile_step_mm``.
+    """
+
     pile_step_mm: float
     live_load_kpa: float
+    width_mm: float | None = None
+    length_mm: float | None = None
+    contour: Contour | None = None
+    piles: tuple[Point, ...] | None = None
     board_thickness_mm: float = 24.0
     board_density_kg_m3: float = 1300.0
+
+    @property
+    def outline(self) -> Contour:
+        """Контур плана."""
+        if self.contour is not None:
+            return self.contour
+        if self.width_mm is None or self.length_mm is None:
+            raise ValueError("Задайте контур или ширину и длину плана.")
+        w, length = self.width_mm, self.length_mm
+        return Contour.from_points([(0, 0), (w, 0), (w, length), (0, length)])
 
     @property
     def board_load_kpa(self) -> float:
@@ -61,44 +80,111 @@ class Design:
     checks: list[BeamCheck]
     governing_member: Member
     governing_check: BeamCheck
+    piles_outside: list[Point] = field(default_factory=list)
+    corners_without_piles: list[Point] = field(default_factory=list)
+    unsupported_members: list[Member] = field(default_factory=list)
 
     def failing_members(self) -> list[Member]:
-        """Элементы, не прошедшие проверку."""
-        return [m for m, c in zip(self.members, self.checks, strict=True) if not c.passed]
-
-
-def _axis(size_mm: float, step_mm: float) -> list[float]:
-    """Координаты рядов свай вдоль оси: равные пролёты, не больше заданного шага."""
-    spans = max(1, math.ceil(size_mm / step_mm))
-    return [size_mm * i / spans for i in range(spans + 1)]
-
-
-def _tributary(coords: list[float], index: int) -> float:
-    """Грузовая ширина ряда: половины соседних пролётов."""
-    left = coords[index] - coords[index - 1] if index > 0 else 0.0
-    right = coords[index + 1] - coords[index] if index < len(coords) - 1 else 0.0
-    return (left + right) / 2
-
-
-def _section_for_row(index: int, count: int) -> Section:
-    """Крайние ряды — периметр 120×120, внутренние — 120×60."""
-    return TUBE_120x120x5 if index in (0, count - 1) else TUBE_120x60x4
-
-
-def _members(xs: list[float], ys: list[float]) -> list[Member]:
-    """Балки по всем рядам свай в одной плоскости."""
-    members = []
-    for row, y in enumerate(ys):
-        section, width = _section_for_row(row, len(ys)), _tributary(ys, row)
-        members += [
-            Member((x0, y), (x1, y), section, width) for x0, x1 in zip(xs, xs[1:], strict=False)
+        """Элементы, не прошедшие проверку, и балки без опоры на одном из концов."""
+        unsupported = {id(m) for m in self.unsupported_members}
+        return [
+            m
+            for m, c in zip(self.members, self.checks, strict=True)
+            if not c.passed or id(m) in unsupported
         ]
-    for col, x in enumerate(xs):
-        section, width = _section_for_row(col, len(xs)), _tributary(xs, col)
-        members += [
-            Member((x, y0), (x, y1), section, width) for y0, y1 in zip(ys, ys[1:], strict=False)
-        ]
-    return members
+
+
+def _axis(breakpoints: list[float], step_mm: float) -> list[float]:
+    """Оси свай: через каждую вершину контура, отрезки между ними — равными пролётами ≤ шага."""
+    marks = sorted(set(breakpoints))
+    axis = [marks[0]]
+    for start, end in zip(marks, marks[1:], strict=False):
+        spans = max(1, math.ceil((end - start) / step_mm))
+        axis += [start + (end - start) * i / spans for i in range(1, spans + 1)]
+    return axis
+
+
+def auto_piles(contour: Contour, step_mm: float) -> list[Point]:
+    """Сваи в узлах осей, попавших внутрь контура или на его границу."""
+    xs = _axis([x for x, _ in contour.vertices], step_mm)
+    ys = _axis([y for _, y in contour.vertices], step_mm)
+    return [(x, y) for y in ys for x in xs if contour.covers((x, y))]
+
+
+#: Допуск, мм: сваи ближе этого к одной линии считаются стоящими на ней.
+LINE_TOLERANCE_MM = 1.0
+
+
+def _on_segment(point: Point, a: Point, b: Point) -> bool:
+    """Точка лежит на горизонтальном или вертикальном отрезке (с допуском)."""
+    (x, y), (ax, ay), (bx, by) = point, a, b
+    if abs(ax - bx) <= LINE_TOLERANCE_MM:
+        return abs(x - ax) <= LINE_TOLERANCE_MM and min(ay, by) <= y <= max(ay, by)
+    return abs(y - ay) <= LINE_TOLERANCE_MM and min(ax, bx) <= x <= max(ax, bx)
+
+
+def _perimeter_members(contour: Contour, piles: list[Point]) -> list[tuple[Point, Point]]:
+    """Периметр: по каждой стороне контура от узла к узлу (вершины и сваи на стороне)."""
+    segments = []
+    vertices = list(contour.vertices)
+    for a, b in zip(vertices, vertices[1:] + vertices[:1], strict=True):
+        nodes = {a, b} | {p for p in piles if _on_segment(p, a, b)}
+        ordered = sorted(nodes, key=lambda n: math.dist(a, n))
+        segments += list(zip(ordered, ordered[1:], strict=False))
+    return segments
+
+
+def _internal_members(contour: Contour, piles: list[Point]) -> list[tuple[Point, Point]]:
+    """Внутренние балки: между соседними сваями на одной линии, только внутри контура."""
+    polygon, boundary = contour.polygon, contour.polygon.boundary
+    segments = []
+    for axis in (0, 1):
+        lines: dict[int, list[Point]] = {}
+        for pile in piles:
+            lines.setdefault(round(pile[1 - axis]), []).append(pile)
+        for line in lines.values():
+            ordered = sorted(line, key=lambda p: p[axis])
+            for a, b in zip(ordered, ordered[1:], strict=False):
+                segment = LineString([a, b])
+                if polygon.covers(segment) and not boundary.covers(segment):
+                    segments.append((a, b))
+    return segments
+
+
+def _tributary_width(contour: Contour, segment: tuple[Point, Point], others) -> float:
+    """Грузовая ширина: половины расстояний до ближайших параллельных балок по обе стороны."""
+    (ax, ay), (bx, by) = segment
+    horizontal = abs(ay - by) <= LINE_TOLERANCE_MM
+    along, across = (0, 1) if horizontal else (1, 0)
+    mid = ((ax + bx) / 2, (ay + by) / 2)
+    distances = {-1: 0.0, 1: 0.0}
+    for oa, ob in others:
+        if abs(oa[across] - ob[across]) > LINE_TOLERANCE_MM:
+            continue  # не параллельна
+        low, high = sorted((oa[along], ob[along]))
+        offset = oa[across] - mid[across]
+        if abs(offset) <= LINE_TOLERANCE_MM or not low <= mid[along] <= high:
+            continue
+        target = list(mid)
+        target[across] = oa[across]
+        if not contour.polygon.covers(LineString([mid, tuple(target)])):
+            continue
+        side = 1 if offset > 0 else -1
+        if distances[side] == 0.0 or abs(offset) < distances[side]:
+            distances[side] = abs(offset)
+    return (distances[-1] + distances[1]) / 2
+
+
+def _members(contour: Contour, piles: list[Point]) -> list[Member]:
+    """Балки каркаса в одной плоскости: периметр 120×120 и внутренние 120×60."""
+    perimeter = _perimeter_members(contour, piles)
+    internal = _internal_members(contour, piles)
+    everything = perimeter + internal
+    return [
+        Member(a, b, section, _tributary_width(contour, (a, b), everything))
+        for segments, section in ((perimeter, TUBE_120x120x5), (internal, TUBE_120x60x4))
+        for a, b in segments
+    ]
 
 
 def _member_load(project: Project, member: Member) -> BeamLoad:
@@ -116,9 +202,21 @@ def _member_load(project: Project, member: Member) -> BeamLoad:
 
 
 def analyze(project: Project) -> Design:
-    xs = _axis(project.width_mm, project.pile_step_mm)
-    ys = _axis(project.length_mm, project.pile_step_mm)
-    members = _members(xs, ys)
+    contour = project.outline
+    piles = (
+        list(project.piles)
+        if project.piles is not None
+        else auto_piles(contour, project.pile_step_mm)
+    )
+    outside = [p for p in piles if not contour.covers(p)]
+    supports = [p for p in piles if contour.covers(p)]
+    members = _members(contour, supports)
+    corners = [
+        v
+        for v in contour.vertices
+        if not any(math.dist(v, p) <= LINE_TOLERANCE_MM for p in supports)
+    ]
+    unsupported = [m for m in members if m.start in corners or m.end in corners]
     checks = [
         check_beam(
             span_mm=m.length_mm, section=m.section, steel=C245, load=_member_load(project, m)
@@ -130,9 +228,12 @@ def analyze(project: Project) -> Design:
         key=lambda cm: max(cm[0].strength_utilization, cm[0].deflection_utilization),
     )
     return Design(
-        piles=[(x, y) for x in xs for y in ys],
+        piles=piles,
         members=members,
         checks=checks,
         governing_member=member,
         governing_check=check,
+        piles_outside=outside,
+        corners_without_piles=corners,
+        unsupported_members=unsupported,
     )
