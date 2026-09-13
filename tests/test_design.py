@@ -1,7 +1,9 @@
-"""Проект целиком: прямоугольный контур и шаг свай → сваи, каркас, проверка.
+"""Проект целиком: контур и сваи → каркас, нагрузки, расчёт грильяжа, проверки, реакции.
 
-Эти тесты рассматривают каркас только по сваям (без балок под стыками листов),
-чтобы эталоны нагрузок и материалов считались вручную на простой схеме.
+Эталоны нагрузок и материалов считаются вручную на простой схеме: квадрат 2000 × 2000 мм на
+четырёх угловых сваях, только периметр. Каждая сторона — однопролётная балка (кручение не
+учитывается), нагрузка с пола по «конверту» — треугольник с пиком w = p·1 м посередине.
+Тогда M = w·L²/12 + g·L²/8, реакция каждой сваи — четверть полной нагрузки.
 """
 
 import pytest
@@ -10,6 +12,20 @@ from pile_frame.boards import BoardSpec
 from pile_frame.design import Project, analyze
 from pile_frame.materials import STEELS
 from pile_frame.sections import TUBE_120x60x4, TUBE_120x120x5
+
+# ЦСП 24 мм, 1300 кг/м³: 1300·9,81·0,024 = 0,306072 кПа.
+BOARD_KPA = 0.306072
+
+
+def _square(**changes):
+    params = {
+        "width_mm": 2000,
+        "length_mm": 2000,
+        "pile_step_mm": 2000,
+        "live_load_kpa": 4.0,
+        "sheet_joints": False,
+    }
+    return analyze(Project(**{**params, **changes}))
 
 
 def test_piles_are_placed_on_a_grid_with_the_given_step():
@@ -39,95 +55,80 @@ def test_frame_has_heavy_perimeter_and_light_internal_beams_between_pile_rows():
     assert internal == pytest.approx([1625] * 4 + [2000] * 6)
 
 
-def test_most_loaded_internal_beam_is_checked_with_floor_and_self_weight_loads():
-    # Внутренняя балка 120×60, пролёт 2 м, грузовая ширина 2 м.
-    # ЦСП 24 мм, 1300 кг/м³: 0,3061 кПа · 2 = 0,6121 кН/м (γf 1,2 → 0,7346);
-    # собственный вес 10,48 кг/м · 9,81 = 0,1028 кН/м (γf 1,05 → 0,1080);
-    # временная 4,0 кПа · 2 = 8,0 кН/м (γf 1,2 → 9,6).
-    # q = 10,4425 кН/м; M = 5,2213 кН·м; σ = 130,14 Н/мм²; 130,14 / 240 = 0,542.
-    design = analyze(
-        Project(
-            width_mm=6000, length_mm=4000, pile_step_mm=2000, live_load_kpa=4.0, sheet_joints=False
-        )
-    )
+def test_pile_reactions_add_up_to_the_full_design_load():
+    # Пол 4 м²: (0,306072·1,2 + 4,0·1,2)·4 = 20,6691 кН.
+    # Периметр 8 м · 17,55 кг/м · 9,81 · 1,05 = 1,4462 кН. Всего 22,1153 кН, по 5,5288 кН на сваю.
+    design = _square()
 
-    assert design.governing_member.section == TUBE_120x60x4
-    assert design.governing_member.length_mm == pytest.approx(2000)
-    assert design.governing_check.strength_utilization == pytest.approx(0.542, abs=0.001)
-    assert design.governing_check.passed
+    reactions = design.reactions_kn
+    assert sum(reactions.values()) == pytest.approx(22.1153, abs=1e-3)
+    assert all(r == pytest.approx(5.5288, abs=1e-3) for r in reactions.values())
+
+
+def test_square_perimeter_beam_matches_hand_calculated_triangular_load():
+    # w = (0,306072·1,2 + 4,0·1,2)·1 м = 5,16729 кН/м; g = 0,17217·1,05 = 0,18077 кН/м.
+    # M = 5,16729·2²/12 + 0,18077·2²/8 = 1,72243 + 0,09039 = 1,81282 кН·м.
+    # σ = 1,81282e6 / 80 880 = 22,41 Н/мм²; 22,41 / 240 = 0,0934.
+    check = _square().governing_check
+
+    assert check.max_moment_knm == pytest.approx(1.8128, abs=1e-3)
+    assert check.strength_utilization == pytest.approx(0.0934, abs=5e-4)
+
+
+def test_shear_follows_formula_42_with_both_webs():
+    # Q = w·L/4 + g·L/2 = 5,16729·0,5 + 0,18077·1 = 2,76442 кН.
+    # 120×120×5 без скруглений: S = 120·5·57,5 + 2·5·55·27,5 = 49 625 мм³;
+    # I = 485,3 см⁴; tw = 2·5 = 10 мм; Rs = 0,58·240 = 139,2 Н/мм².
+    # τ = 2 764,42·49 625 / (4 853 000·10) = 2,827 Н/мм²; 2,827 / 139,2 = 0,0203.
+    check = _square().governing_check
+
+    assert check.max_shear_kn == pytest.approx(2.7644, abs=1e-3)
+    assert check.shear_utilization == pytest.approx(0.0203, abs=2e-4)
 
 
 def test_light_live_load_uses_higher_load_factor():
-    # СП 20.13330, п. 8.2.2: γf = 1,3 при нормативной нагрузке < 2,0 кПа.
-    # q = 0,8425 + 1,5·2·1,3 = 4,7425 кН/м; M = 2,3713 кН·м; σ = 59,10 Н/мм²; 0,246.
-    # (С γf = 1,2 было бы 0,231.)
-    design = analyze(
-        Project(
-            width_mm=6000, length_mm=4000, pile_step_mm=2000, live_load_kpa=1.5, sheet_joints=False
-        )
-    )
+    # Временная 1,5 кПа < 2,0 → γf = 1,3. Пол: (0,367286 + 1,5·1,3)·4 = 9,26914 кН; периметр 1,4462.
+    # Сумма реакций 10,7153 кН (с γf = 1,2 было бы 10,1153).
+    reactions = _square(live_load_kpa=1.5).reactions_kn
 
-    assert design.governing_check.strength_utilization == pytest.approx(0.246, abs=0.001)
+    assert sum(reactions.values()) == pytest.approx(10.7153, abs=1e-3)
 
 
-def test_plan_without_internal_rows_checks_perimeter_with_half_span_tributary():
-    # Только периметр 120×120×5, пролёт 2 м, грузовая ширина 1 м.
-    # q = 0,3061·1,2 + 0,1722·1,05 + 4,0·1,2 = 5,348 кН/м; M = 2,674 кН·м;
-    # σ = 2,674e6 / 80 880 = 33,06 Н/мм²; 33,06 / 240 = 0,138.
-    design = analyze(
-        Project(
-            width_mm=2000, length_mm=2000, pile_step_mm=2000, live_load_kpa=4.0, sheet_joints=False
-        )
-    )
+def test_lighter_perimeter_profile_changes_self_weight_and_resistance():
+    # 120×60×4: g = 10,48·9,81·1,05 = 0,10795 кН/м; M = 1,72243 + 0,10795·4/8 = 1,77641 кН·м;
+    # σ = 1,77641e6 / 40 120 = 44,28 Н/мм²; 44,28 / 240 = 0,1845.
+    check = _square(perimeter_section=TUBE_120x60x4).governing_check
 
-    assert design.governing_member.section == TUBE_120x120x5
-    assert design.governing_check.strength_utilization == pytest.approx(0.138, abs=0.001)
+    assert check.strength_utilization == pytest.approx(0.1845, abs=5e-4)
+
+
+def test_stronger_steel_uses_its_design_resistance():
+    # С355, стенка 5 мм: Ry = 350. σ = 22,41 Н/мм² → 22,41 / 350 = 0,0640.
+    check = _square(steel=STEELS["С355"]).governing_check
+
+    assert check.strength_utilization == pytest.approx(0.0640, abs=5e-4)
+
+
+def test_thicker_board_adds_floor_load():
+    # ЦСП 36 мм: 0,459108·1,2 = 0,55093 кПа; w = 5,35093 кН/м;
+    # M = 5,35093·4/12 + 0,09039 = 1,87403 кН·м; σ = 23,17 Н/мм²; 23,17 / 240 = 0,0965.
+    check = _square(board=BoardSpec(thickness_mm=36)).governing_check
+
+    assert check.strength_utilization == pytest.approx(0.0965, abs=5e-4)
 
 
 def test_every_overstressed_member_is_reported_not_only_the_governing_one():
-    # 9000 × 6000, шаг 3000, 4,0 кПа.
-    # Внутренние 120×60 (грузовая ширина 3 м): использование ≈ 1,82 — не проходят, их 3 + 2·2 = 7.
-    # Периметр 120×120 (грузовая ширина 1,5 м): q ≈ 7,93 кН/м, σ ≈ 110 Н/мм², ≈ 0,46 — проходит.
+    # 2000 × 6000 на угловых сваях (шаг 6000). Длинные стороны — трапеция с подъёмом 1 м:
+    # M = w·(3L² − 4a²)/24 + g·L²/8 = 5,16729·(108 − 4)/24 + 0,18077·36/8
+    #   = 22,39 + 0,81 = 23,21 кН·м;
+    # σ = 287,0 Н/мм² > 240 — не проходят. Короткие: M = 1,81 кН·м, 0,093 — проходят.
     design = analyze(
         Project(
-            width_mm=9000, length_mm=6000, pile_step_mm=3000, live_load_kpa=4.0, sheet_joints=False
+            width_mm=2000, length_mm=6000, pile_step_mm=6000, live_load_kpa=4.0, sheet_joints=False
         )
     )
 
     failing = design.failing_members()
 
-    assert len(failing) == 7
-    assert {m.section for m in failing} == {TUBE_120x60x4}
-
-
-BASE = {
-    "width_mm": 6000,
-    "length_mm": 4000,
-    "pile_step_mm": 2000,
-    "live_load_kpa": 4.0,
-    "sheet_joints": False,
-}
-
-
-def test_heavier_internal_profile_lowers_utilization():
-    # 120×120×5 вместо 120×60×4. Нагрузка: ЦСП 0,6121·1,2 + вес 17,55 кг/м·9,81 = 0,1722·1,05
-    #   + 8,0·1,2 = 10,515 кН/м; M = 5,2577 кН·м;
-    #   σ = 5,2577e6 / 80 880 = 65,01 Н/мм²; / 240 = 0,271.
-    design = analyze(Project(**BASE, internal_section=TUBE_120x120x5))
-
-    assert design.governing_check.strength_utilization == pytest.approx(0.271, abs=0.001)
-
-
-def test_stronger_steel_uses_its_design_resistance():
-    # С355, стенка 4 мм: Ry = 350 (таблица В.3). σ = 130,14 Н/мм² → 130,14 / 350 = 0,372.
-    design = analyze(Project(**BASE, steel=STEELS["С355"]))
-
-    assert design.governing_check.strength_utilization == pytest.approx(0.372, abs=0.001)
-
-
-def test_thicker_board_adds_floor_load():
-    # ЦСП 36 мм: 1300·9,81·0,036 = 0,4591 кПа · 2 = 0,9182 кН/м (γf 1,2 → 1,1019);
-    # q = 1,1019 + 0,1079 + 9,6 = 10,810 кН/м; M = 5,4049 кН·м; σ = 134,72 Н/мм²; 0,561.
-    design = analyze(Project(**BASE, board=BoardSpec(thickness_mm=36)))
-
-    assert design.governing_check.strength_utilization == pytest.approx(0.561, abs=0.001)
+    assert len(failing) == 2
+    assert all(m.length_mm == pytest.approx(6000) for m in failing)

@@ -1,4 +1,4 @@
-"""Проект каркаса: план на сваях → сваи, элементы каркаса, проверка."""
+"""Проект каркаса: план на сваях → сваи, элементы каркаса, расчёт и проверки."""
 
 from __future__ import annotations
 
@@ -7,23 +7,20 @@ from dataclasses import dataclass, field
 
 from shapely.geometry import LineString
 
-from pile_frame.beam import BeamCheck, BeamLoad, check_beam
+from pile_frame.analysis import (
+    GRAVITY,
+    AnalysisError,
+    MemberCheck,
+    analyze_frame,
+    gamma_f_live,
+)
 from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour, Point
 from pile_frame.materials import C245, Steel
 from pile_frame.sections import Section, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.sheets import LongSide, SheetLayout, layout_sheets
 
-GRAVITY = 9.81  # м/с²
-
-#: Коэффициенты надёжности по нагрузке (СП 20.13330.2016).
-GAMMA_F_STEEL = 1.05  # металлические конструкции, таблица 7.1
-GAMMA_F_BOARD = 1.2  # плиты заводского изготовления, таблица 7.1
-
-
-def gamma_f_live(live_load_kpa: float) -> float:
-    """γf для равномерной временной нагрузки: 1,3 при < 2,0 кПа, иначе 1,2 (п. 8.2.2)."""
-    return 1.3 if live_load_kpa < 2.0 else 1.2
+__all__ = ["GRAVITY", "AnalysisError", "gamma_f_live"]
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -68,12 +65,11 @@ class Project:
 
 @dataclass(frozen=True)
 class Member:
-    """Элемент каркаса между двумя сваями, координаты в мм."""
+    """Элемент каркаса между двумя узлами (сваи, пересечения балок), координаты в мм."""
 
     start: tuple[float, float]
     end: tuple[float, float]
     section: Section
-    tributary_width_mm: float
 
     @property
     def length_mm(self) -> float:
@@ -86,9 +82,10 @@ class Design:
 
     piles: list[tuple[float, float]]
     members: list[Member]
-    checks: list[BeamCheck]
+    checks: list[MemberCheck]
     governing_member: Member
-    governing_check: BeamCheck
+    governing_check: MemberCheck
+    reactions_kn: dict[Point, float] = field(default_factory=dict)
     piles_outside: list[Point] = field(default_factory=list)
     corners_without_piles: list[Point] = field(default_factory=list)
     unsupported_members: list[Member] = field(default_factory=list)
@@ -159,30 +156,6 @@ def _internal_members(contour: Contour, piles: list[Point]) -> list[tuple[Point,
                 if polygon.covers(segment) and not boundary.covers(segment):
                     segments.append((a, b))
     return segments
-
-
-def _tributary_width(contour: Contour, segment: tuple[Point, Point], others) -> float:
-    """Грузовая ширина: половины расстояний до ближайших параллельных балок по обе стороны."""
-    (ax, ay), (bx, by) = segment
-    horizontal = abs(ay - by) <= LINE_TOLERANCE_MM
-    along, across = (0, 1) if horizontal else (1, 0)
-    mid = ((ax + bx) / 2, (ay + by) / 2)
-    distances = {-1: 0.0, 1: 0.0}
-    for oa, ob in others:
-        if abs(oa[across] - ob[across]) > LINE_TOLERANCE_MM:
-            continue  # не параллельна
-        low, high = sorted((oa[along], ob[along]))
-        offset = oa[across] - mid[across]
-        if abs(offset) <= LINE_TOLERANCE_MM or not low <= mid[along] <= high:
-            continue
-        target = list(mid)
-        target[across] = oa[across]
-        if not contour.polygon.covers(LineString([mid, tuple(target)])):
-            continue
-        side = 1 if offset > 0 else -1
-        if distances[side] == 0.0 or abs(offset) < distances[side]:
-            distances[side] = abs(offset)
-    return (distances[-1] + distances[1]) / 2
 
 
 def _parts(geometry) -> list[LineString]:
@@ -267,26 +240,26 @@ def _members(
             perimeter + internal,
             internal_section.width_mm / 2,
         )
-    everything = perimeter + internal
-    return [
-        Member(a, b, section, _tributary_width(contour, (a, b), everything))
-        for segments, section in ((perimeter, perimeter_section), (internal, internal_section))
-        for a, b in segments
-    ]
+    typed = [(seg, perimeter_section) for seg in perimeter]
+    typed += [(seg, internal_section) for seg in internal]
+    return [Member(a, b, section) for (a, b), section in _split_at_nodes(typed)]
 
 
-def _member_load(project: Project, member: Member) -> BeamLoad:
-    """Нагрузка на балку с грузовой полосы, кН/м (упрощение #1: пол опирается на балку целиком)."""
-    width_m = member.tributary_width_mm / 1e3
-    board = project.board_load_kpa * width_m
-    self_weight = member.section.mass_kg_m * GRAVITY / 1e3
-    live = project.live_load_kpa * width_m
-    return BeamLoad(
-        dead_normative=board + self_weight,
-        dead_design=board * GAMMA_F_BOARD + self_weight * GAMMA_F_STEEL,
-        live_normative=live,
-        live_design=live * gamma_f_live(project.live_load_kpa),
-    )
+def _split_at_nodes(typed: list[tuple[tuple[Point, Point], Section]]):
+    """Разрезать балки в узлах, где к ним примыкают другие балки (Т-образные примыкания)."""
+    ends = {p for (a, b), _ in typed for p in (a, b)}
+    result = []
+    for (a, b), section in typed:
+        inner = [
+            p
+            for p in ends
+            if p not in (a, b)
+            and _on_segment(p, a, b)
+            and LINE_TOLERANCE_MM < math.dist(a, p) < math.dist(a, b) - LINE_TOLERANCE_MM
+        ]
+        points = [a, *sorted(inner, key=lambda p: math.dist(a, p)), b]
+        result += [((p, q), section) for p, q in zip(points, points[1:], strict=False)]
+    return result
 
 
 def analyze(project: Project) -> Design:
@@ -318,25 +291,15 @@ def analyze(project: Project) -> Design:
         if not any(math.dist(v, p) <= LINE_TOLERANCE_MM for p in supports)
     ]
     unsupported = [m for m in members if m.start in corners or m.end in corners]
-    checks = [
-        check_beam(
-            span_mm=m.length_mm,
-            section=m.section,
-            steel=project.steel,
-            load=_member_load(project, m),
-        )
-        for m in members
-    ]
-    check, member = max(
-        zip(checks, members, strict=True),
-        key=lambda cm: max(cm[0].strength_utilization, cm[0].deflection_utilization),
-    )
+    checks, reactions = analyze_frame(project, contour, supports, members)
+    check, member = max(zip(checks, members, strict=True), key=lambda cm: cm[0].utilization)
     return Design(
         piles=piles,
         members=members,
         checks=checks,
         governing_member=member,
         governing_check=check,
+        reactions_kn=reactions,
         piles_outside=outside,
         corners_without_piles=corners,
         unsupported_members=unsupported,

@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 import numpy as np
 
 TOLERANCE_MM = 1e-6
+#: Узлы и веса квадратуры Гаусса: точна для нагрузки, линейной по длине участка.
+_GAUSS_POINTS, _GAUSS_WEIGHTS = np.polynomial.legendre.leggauss(6)
 
 
 @dataclass
@@ -112,11 +114,14 @@ class Grillage:
         n = 3 * len(self.nodes)
         stiffness = np.zeros((n, n))
         loads = np.zeros(n)
+        self._element_cache = []
         for beam in self.beams:
             dofs = self._dofs(beam)
             k = _stiffness(beam.ei, beam.length(self.nodes))
+            fixed_end = self._fixed_end(beam)
+            self._element_cache.append((dofs, k, fixed_end))
             stiffness[np.ix_(dofs, dofs)] += k
-            loads[dofs] += self._fixed_end(beam)
+            loads[dofs] += fixed_end
         for node, force in self.point_loads.items():
             loads[3 * node] += force
 
@@ -138,7 +143,7 @@ def _partial_load_vector(length: float, s0: float, s1: float, q0: float, q1: flo
         return np.zeros(4)
     if s0 <= TOLERANCE_MM and length - s1 <= TOLERANCE_MM:
         return _equivalent_loads(length, q0, q1)
-    points, weights = np.polynomial.legendre.leggauss(6)
+    points, weights = _GAUSS_POINTS, _GAUSS_WEIGHTS
     vector = np.zeros(4)
     half = (s1 - s0) / 2
     for p, w in zip(points, weights, strict=True):
@@ -163,26 +168,21 @@ class GrillageResult:
     def __init__(self, model: Grillage, displacements: np.ndarray) -> None:
         self._model = model
         self._u = displacements
+        self._forces = [k @ displacements[dofs] - fixed for dofs, k, fixed in model._element_cache]
+        self._reactions = {node: -force for node, force in model.point_loads.items()}
+        for beam, forces in zip(model.beams, self._forces, strict=True):
+            self._reactions[beam.i] = self._reactions.get(beam.i, 0.0) - forces[0]
+            self._reactions[beam.j] = self._reactions.get(beam.j, 0.0) - forces[2]
 
     def deflection(self, node: int) -> float:
         return float(self._u[3 * node])
 
     def _end_forces(self, beam: int) -> np.ndarray:
-        b = self._model.beams[beam]
-        dofs = self._model._dofs(b)
-        k = _stiffness(b.ei, b.length(self._model.nodes))
-        return k @ self._u[dofs] - self._model._fixed_end(b)
+        return self._forces[beam]
 
     def reaction(self, node: int) -> float:
         """Реакция опоры вверх, Н."""
-        total = -self._model.point_loads.get(node, 0.0)
-        for index, b in enumerate(self._model.beams):
-            forces = self._end_forces(index)
-            if b.i == node:
-                total -= forces[0]
-            if b.j == node:
-                total -= forces[2]
-        return float(total)
+        return float(self._reactions.get(node, 0.0))
 
     def end_moments(self, beam: int) -> tuple[float, float]:
         """Изгибающие моменты в начале и в конце балки, Н·мм; растянутый низ — плюс."""
