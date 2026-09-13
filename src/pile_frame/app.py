@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QScrollArea,
     QSpinBox,
+    QSplitter,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -48,6 +49,7 @@ from pile_frame.inputs import NumberField, ProfilesDialog
 from pile_frame.issues import Issue, errors
 from pile_frame.materials import C245, STEELS
 from pile_frame.qt_theme import THEME_MODES, apply_theme, resolve_theme, status_icon
+from pile_frame.results import ResultsPanel
 from pile_frame.sections import ProfileCatalog, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.status import Status, classify
 from pile_frame.theme import LIGHT, Theme
@@ -118,6 +120,7 @@ class PlanView(QGraphicsView):
         self._rectangle = False  # идёт протягивание прямоугольника
         self._vertices: list[Point] = []  # вершины рисуемого контура
         self._dragged_pile: Point | None = None
+        self._selected: int | None = None
         self._redraw()
 
     # --- состояние и отрисовка -------------------------------------------------------
@@ -135,8 +138,17 @@ class PlanView(QGraphicsView):
         self.grid_step_mm = step_mm
         self._redraw()
 
+    def select_member(self, index: int | None) -> None:
+        self._selected = index
+        self._redraw()
+
+    def selected_member(self) -> int | None:
+        return self._selected
+
     def show_design(self, design: Design | None) -> None:
         self._design = design
+        if design is None or (self._selected is not None and self._selected >= len(design.members)):
+            self._selected = None
         self._redraw()
 
     def pile_count(self) -> int:
@@ -218,6 +230,13 @@ class PlanView(QGraphicsView):
             pen.setCapStyle(Qt.PenCapStyle.FlatCap)
             (x0, y0), (x1, y1) = member.start, member.end
             self._scene.addLine(x0, y0, x1, y1, pen)
+        if self._selected is not None:
+            member = design.members[self._selected]
+            halo = QPen(QColor(t.focus), member.section.width_mm + 80)
+            halo.setCapStyle(Qt.PenCapStyle.RoundCap)
+            (x0, y0), (x1, y1) = member.start, member.end
+            line = self._scene.addLine(x0, y0, x1, y1, halo)
+            line.setOpacity(0.45)
 
     def _draw_piles(self) -> None:
         t, r = self._theme, PILE_DIAMETER_MM / 2
@@ -359,7 +378,9 @@ class ResultCard(QFrame):
         "Не проходят",
         "Балка",
         "Прочность",
+        "Срез",
         "Прогиб",
+        "Макс. реакция сваи",
         "Листы",
         "Обрезки",
         "Замечания",
@@ -408,7 +429,7 @@ class ResultCard(QFrame):
 
     def show_design(self, contour: Contour, design: Design) -> None:
         check, member = design.governing_check, design.governing_member
-        utilization = max(check.strength_utilization, check.deflection_utilization)
+        utilization = check.utilization
         has_errors = bool(design.failing_members() or design.piles_outside)
         self._status = Status.FAIL if has_errors and utilization <= 1.0 else classify(utilization)
         v = self._values
@@ -420,6 +441,9 @@ class ResultCard(QFrame):
         v["Не проходят"].setText(f"{len(design.failing_members())} из {len(design.members)}")
         v["Балка"].setText(f"{member.section.name}, {member.length_mm:.0f} мм")
         v["Прочность"].setText(f"{check.strength_utilization:.0%}")
+        v["Срез"].setText(f"{check.shear_utilization:.0%}")
+        reactions = design.reactions_kn.values()
+        v["Макс. реакция сваи"].setText(f"{_fmt(max(reactions, default=0.0), 2)} кН")
         v["Прогиб"].setText(
             f"{_fmt(check.deflection_mm)} из {_fmt(check.deflection_limit_mm)} мм "
             f"({check.deflection_utilization:.0%})"
@@ -493,6 +517,8 @@ class MainWindow(QMainWindow):
         self.editor = PlanEditor(pile_step_mm=self.pile_step.value())
         self.plan = PlanView(self.editor)
         self.result_card = ResultCard()
+        self.results = ResultsPanel()
+        self.last_design: Design | None = None
 
         self.catalog = ProfileCatalog.from_json(str(_settings().value("profiles", "[]")))
         self.perimeter_profile = QComboBox()
@@ -570,7 +596,13 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
-        layout.addWidget(self.plan, stretch=1)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.addWidget(self.plan)
+        splitter.addWidget(self.results)
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([560, 300])
+        layout.addWidget(splitter, stretch=1)
         layout.addWidget(scroll)
         self.setCentralWidget(root)
 
@@ -582,6 +614,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
 
         self.plan.edited.connect(self._recalculate)
+        self.results.member_selected.connect(self.plan.select_member)
         self.plan.message.connect(self._message.setText)
         self.plan.cursor_moved.connect(self._show_cursor)
         self.pile_step.valueChanged.connect(self._on_pile_step)
@@ -785,6 +818,8 @@ class MainWindow(QMainWindow):
         contour = self.editor.contour
         if contour is None or not self.editor.piles:
             self.plan.show_design(None)
+            self.results.show_design(None)
+            self.last_design = None
             self.result_card.clear()
             return
         design = analyze(
@@ -802,7 +837,9 @@ class MainWindow(QMainWindow):
                 sheet_gap_mm=sheets[1],
             )
         )
+        self.last_design = design
         self.plan.show_design(design)
+        self.results.show_design(design)
         self.result_card.show_design(contour, design)
 
     def result_text(self) -> str:

@@ -139,3 +139,19 @@ def test_rotating_sheets_changes_layout_and_rebuilds_frame(qtbot):
 
     assert window.result_card.value("Листы") == "4 целых, 6 резаных"
     assert window.result_card.value("Не проходят").split(" из ")[1] != members_before
+
+
+def test_results_table_sorts_by_utilization_and_row_click_selects_member(qtbot):
+    window = _window_with_rectangle(qtbot)
+    table = window.results.members
+    design = window.last_design
+    assert table.model().rowCount() == len(design.members)
+
+    table.sortByColumn(window.results.UTILIZATION_COLUMN, Qt.SortOrder.DescendingOrder)
+    top_member = window.results.member_index_at(0)
+    assert design.checks[top_member].utilization == max(c.utilization for c in design.checks)
+
+    row_rect = table.visualRect(table.model().index(2, 0))
+    QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton, pos=row_rect.center())
+
+    assert window.plan.selected_member() == window.results.member_index_at(2)
