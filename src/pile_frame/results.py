@@ -1,11 +1,18 @@
-"""Таблицы результатов: проверки элементов и реакции свай."""
+"""Результаты: проверки балок, реакции свай, сварные швы и допущения."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, Signal
 from PySide6.QtGui import QStandardItem, QStandardItemModel
-from PySide6.QtWidgets import QAbstractItemView, QHeaderView, QTableView, QTabWidget
+from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QHeaderView,
+    QPlainTextEdit,
+    QTableView,
+    QTabWidget,
+)
 
+from pile_frame import assumptions
 from pile_frame.design import Design
 from pile_frame.status import classify
 
@@ -48,7 +55,7 @@ def _table() -> QTableView:
 
 
 class ResultsPanel(QTabWidget):
-    """Вкладки «Балки» и «Сваи». Выбор строки балки сообщает её индекс."""
+    """Вкладки «Балки», «Сваи и реакции», «Швы», «Допущения». Выбор балки сообщает её индекс."""
 
     member_selected = Signal(int)
 
@@ -62,6 +69,8 @@ class ResultsPanel(QTabWidget):
         "Срез, %",
         "Прогиб, мм",
         "Прогиб, %",
+        "Стенка, %",
+        "Пояс, %",
         "Использование, %",
         "Итог",
     )
@@ -86,12 +95,36 @@ class ResultsPanel(QTabWidget):
         self.piles = _table()
         self.piles.setModel(pile_proxy)
 
+        self._weld_model = QStandardItemModel(0, 7)
+        self._weld_model.setHorizontalHeaderLabels(
+            [
+                "X, мм",
+                "Y, мм",
+                "Сила, кН",
+                "Катет, мм",
+                "Длина, мм",
+                "Расчёт по",
+                "Использование, %",
+            ]
+        )
+        weld_proxy = QSortFilterProxyModel()
+        weld_proxy.setSourceModel(self._weld_model)
+        weld_proxy.setSortRole(SORT_ROLE)
+        self.welds = _table()
+        self.welds.setModel(weld_proxy)
+
+        self.assumptions = QPlainTextEdit(assumptions.as_text())
+        self.assumptions.setReadOnly(True)
+
         self.addTab(self.members, "Балки")
         self.addTab(self.piles, "Сваи и реакции")
+        self.addTab(self.welds, "Швы")
+        self.addTab(self.assumptions, "Допущения")
 
     def show_design(self, design: Design | None) -> None:
         self._member_model.setRowCount(0)
         self._pile_model.setRowCount(0)
+        self._weld_model.setRowCount(0)
         if design is None:
             return
         unsupported = {id(m) for m in design.unsupported_members}
@@ -108,6 +141,8 @@ class ResultsPanel(QTabWidget):
                 _item(f"{check.shear_utilization:.0%}", check.shear_utilization),
                 _item(_fmt(check.deflection_mm), check.deflection_mm),
                 _item(f"{check.deflection_utilization:.0%}", check.deflection_utilization),
+                _item(f"{check.web_utilization:.0%}", check.web_utilization),
+                _item(f"{check.flange_utilization:.0%}", check.flange_utilization),
                 _item(f"{check.utilization:.0%}", check.utilization),
                 _item(verdict, check.utilization),
             ]
@@ -121,6 +156,23 @@ class ResultsPanel(QTabWidget):
                     _item(_fmt(reaction, 2), reaction),
                 ]
             )
+
+        for weld in design.welds:
+            check = weld.check
+            self._weld_model.appendRow(
+                [
+                    _item(f"{weld.point[0]:.0f}", weld.point[0]),
+                    _item(f"{weld.point[1]:.0f}", weld.point[1]),
+                    _item(_fmt(check.force_kn, 2), check.force_kn),
+                    _item(str(check.leg_mm), check.leg_mm),
+                    _item(f"{check.length_mm:.0f}", check.length_mm),
+                    _item(check.governing, check.governing),
+                    _item(f"{check.utilization:.0%}", check.utilization),
+                ]
+            )
+
+    def assumptions_text(self) -> str:
+        return self.assumptions.toPlainText()
 
     def member_index_at(self, row: int) -> int:
         """Индекс элемента в проекте для строки таблицы с учётом сортировки."""

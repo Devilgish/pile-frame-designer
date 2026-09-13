@@ -155,3 +155,10 @@ def test_results_table_sorts_by_utilization_and_row_click_selects_member(qtbot):
     QTest.mouseClick(table.viewport(), Qt.MouseButton.LeftButton, pos=row_rect.center())
 
     assert window.plan.selected_member() == window.results.member_index_at(2)
+
+
+def test_welds_and_assumptions_tabs_are_filled(qtbot):
+    window = _window_with_rectangle(qtbot)
+
+    assert window.results.welds.model().rowCount() == len(window.last_design.welds) > 0
+    assert "кручени" in window.results.assumptions_text().lower()

@@ -53,6 +53,7 @@ from pile_frame.results import ResultsPanel
 from pile_frame.sections import ProfileCatalog, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.status import Status, classify
 from pile_frame.theme import LIGHT, Theme
+from pile_frame.welds import DEFAULT_ELECTRODE, ELECTRODES
 
 GRID_STEPS_MM = (50, 100, 250, 500)
 DEFAULT_GRID_STEP_MM = 250
@@ -432,6 +433,8 @@ class ResultCard(QFrame):
         utilization = check.utilization
         has_errors = bool(design.failing_members() or design.piles_outside)
         self._status = Status.FAIL if has_errors and utilization <= 1.0 else classify(utilization)
+        if design.electrode_issue and self._status is Status.OK:
+            self._status = Status.WARNING
         v = self._values
         xs = [x for x, _ in contour.vertices]
         ys = [y for _, y in contour.vertices]
@@ -451,6 +454,11 @@ class ResultCard(QFrame):
         notes = []
         if design.piles_outside:
             notes.append(f"свай вне контура: {len(design.piles_outside)}")
+        failing_welds = sum(1 for w in design.welds if w.check.utilization > 1)
+        if failing_welds:
+            notes.append(f"швов не проходит: {failing_welds}")
+        if design.electrode_issue:
+            notes.append("электрод не по п. 14.1.8")
         if design.corners_without_piles:
             notes.append(f"углов без свай: {len(design.corners_without_piles)}")
         v["Замечания"].setText(", ".join(notes) if notes else "нет")
@@ -529,6 +537,12 @@ class MainWindow(QMainWindow):
         self.steel = QComboBox()
         self.steel.addItems(list(STEELS))
         self.steel.setCurrentText(C245.name)
+        self.electrode = QComboBox()
+        self.electrode.addItems(list(ELECTRODES))
+        self.electrode.setCurrentText(DEFAULT_ELECTRODE)
+        self.electrode_issue = QLabel()
+        self.electrode_issue.setWordWrap(True)
+        self.electrode_issue.hide()
 
         defaults = BoardSpec()
         self.board_format = QComboBox()
@@ -557,6 +571,8 @@ class MainWindow(QMainWindow):
         frame_form.addRow("Периметр", self.perimeter_profile)
         frame_form.addRow("Внутренние балки", self.internal_profile)
         frame_form.addRow("Сталь", self.steel)
+        frame_form.addRow("Электрод", self.electrode)
+        frame_form.addRow(self.electrode_issue)
         board_form = self._form()
         board_form.addRow("Формат", self.board_format)
         board_form.addRow("Длина", self.board_fields["length_mm"])
@@ -619,7 +635,7 @@ class MainWindow(QMainWindow):
         self.plan.cursor_moved.connect(self._show_cursor)
         self.pile_step.valueChanged.connect(self._on_pile_step)
         self.live_load.valueChanged.connect(self._recalculate)
-        for combo in (self.perimeter_profile, self.internal_profile, self.steel):
+        for combo in (self.perimeter_profile, self.internal_profile, self.steel, self.electrode):
             combo.currentIndexChanged.connect(self._recalculate)
         self.board_format.currentIndexChanged.connect(self._on_board_format)
         self.sheet_long_side.currentIndexChanged.connect(self._recalculate)
@@ -831,6 +847,7 @@ class MainWindow(QMainWindow):
                 perimeter_section=self.catalog.get(self.perimeter_profile.currentText()),
                 internal_section=self.catalog.get(self.internal_profile.currentText()),
                 steel=STEELS[self.steel.currentText()],
+                electrode=self.electrode.currentText(),
                 board=board,
                 sheet_long_side=self.sheet_long_side.currentData(),
                 sheet_offset_mm=sheets[0],
@@ -838,6 +855,13 @@ class MainWindow(QMainWindow):
             )
         )
         self.last_design = design
+        theme = resolve_theme(self._theme_mode)
+        if design.electrode_issue:
+            self.electrode_issue.setText("Внимание: " + design.electrode_issue)
+            self.electrode_issue.setStyleSheet(f"color: {theme.warning}; font-size: 9pt;")
+            self.electrode_issue.show()
+        else:
+            self.electrode_issue.hide()
         self.plan.show_design(design)
         self.results.show_design(design)
         self.result_card.show_design(contour, design)
