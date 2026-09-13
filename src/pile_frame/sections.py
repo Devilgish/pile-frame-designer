@@ -77,12 +77,18 @@ class ProfileCatalog:
                 return section
         raise KeyError(name)
 
-    def add(self, **fields: float | str) -> list[Issue]:
-        """Добавить свой профиль. Если есть ошибки, профиль не добавляется."""
+    def validate(self, **fields: float | str) -> list[Issue]:
+        """Замечания к своему профилю с учётом уже имеющихся названий."""
         issues = validate_section(**fields)
         name = str(fields.get("name", "")).strip()
         if name and any(s.name == name for s in self.sections):
             issues.append(Issue("name", f"Профиль «{name}» уже есть в справочнике."))
+        return issues
+
+    def add(self, **fields: float | str) -> list[Issue]:
+        """Добавить свой профиль. Если есть ошибки, профиль не добавляется."""
+        issues = self.validate(**fields)
+        name = str(fields.get("name", "")).strip()
         if not issues:
             numbers = {k: float(v) for k, v in fields.items() if k != "name"}
             self._custom.append(Section(name=name, **numbers))

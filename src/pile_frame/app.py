@@ -31,16 +31,22 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QScrollArea,
     QSpinBox,
     QToolBar,
     QVBoxLayout,
     QWidget,
 )
 
+from pile_frame.boards import GOST_FORMATS_MM, BoardSpec, validate_board
 from pile_frame.contour import Contour, ContourError, Point
 from pile_frame.design import Design, Project, analyze
 from pile_frame.editor import PlanEditor
+from pile_frame.inputs import NumberField, ProfilesDialog
+from pile_frame.issues import Issue, errors
+from pile_frame.materials import C245, STEELS
 from pile_frame.qt_theme import THEME_MODES, apply_theme, resolve_theme, status_icon
+from pile_frame.sections import ProfileCatalog, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.status import Status, classify
 from pile_frame.theme import LIGHT, Theme
 
@@ -56,6 +62,7 @@ SETTINGS_ORG = "pile-frame-designer"
 SETTINGS_APP = "pile-frame-designer"
 THEME_LABELS = {"system": "Как в системе", "light": "Светлая", "dark": "Тёмная"}
 TOOL_LABELS = {"contour": "Контур", "piles": "Сваи"}
+CUSTOM_FORMAT = "Свой размер"
 
 
 def snap(value_mm: float, step_mm: float = DEFAULT_GRID_STEP_MM) -> float:
@@ -414,6 +421,9 @@ class ResultCard(QFrame):
     def status(self) -> Status | None:
         return self._status
 
+    def value(self, row: str) -> str:
+        return self._values[row].text()
+
     def status_text(self) -> str:
         return self._title.text()
 
@@ -449,30 +459,72 @@ class MainWindow(QMainWindow):
         self.plan = PlanView(self.editor)
         self.result_card = ResultCard()
 
-        form = QFormLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(8)
-        form.addRow("Шаг свай", self.pile_step)
-        form.addRow("Временная нагрузка", self.live_load)
+        self.catalog = ProfileCatalog.from_json(str(_settings().value("profiles", "[]")))
+        self.perimeter_profile = QComboBox()
+        self.internal_profile = QComboBox()
+        self._fill_profiles()
+        self.perimeter_profile.setCurrentText(TUBE_120x120x5.name)
+        self.internal_profile.setCurrentText(TUBE_120x60x4.name)
+        self.steel = QComboBox()
+        self.steel.addItems(list(STEELS))
+        self.steel.setCurrentText(C245.name)
+
+        defaults = BoardSpec()
+        self.board_format = QComboBox()
+        for length, width in GOST_FORMATS_MM:
+            self.board_format.addItem(f"{length} × {width} мм", (length, width))
+        self.board_format.addItem(CUSTOM_FORMAT, None)
+        self.board_format.setCurrentIndex(
+            GOST_FORMATS_MM.index((defaults.length_mm, defaults.width_mm))
+        )
+        self.board_fields = {
+            "length_mm": NumberField(defaults.length_mm, "мм"),
+            "width_mm": NumberField(defaults.width_mm, "мм"),
+            "thickness_mm": NumberField(defaults.thickness_mm, "мм"),
+            "density_kg_m3": NumberField(defaults.density_kg_m3, "кг/м³"),
+        }
+
+        frame_form = self._form()
+        frame_form.addRow("Периметр", self.perimeter_profile)
+        frame_form.addRow("Внутренние балки", self.internal_profile)
+        frame_form.addRow("Сталь", self.steel)
+        board_form = self._form()
+        board_form.addRow("Формат", self.board_format)
+        board_form.addRow("Длина", self.board_fields["length_mm"])
+        board_form.addRow("Ширина", self.board_fields["width_mm"])
+        board_form.addRow("Толщина", self.board_fields["thickness_mm"])
+        board_form.addRow("Плотность", self.board_fields["density_kg_m3"])
+        load_form = self._form()
+        load_form.addRow("Шаг свай", self.pile_step)
+        load_form.addRow("Временная нагрузка", self.live_load)
 
         panel = QWidget()
         panel.setObjectName("panel")
-        panel.setFixedWidth(320)
         side = QVBoxLayout(panel)
-        side.setContentsMargins(0, 0, 0, 0)
+        side.setContentsMargins(0, 0, 8, 0)
         side.setSpacing(8)
-        side.addWidget(_section("Исходные данные"))
-        side.addLayout(form)
+        side.addWidget(_section("Сваи и нагрузка"))
+        side.addLayout(load_form)
+        side.addWidget(_section("Каркас"))
+        side.addLayout(frame_form)
+        side.addWidget(_section("Пол: ЦСП, ГОСТ 26816-2016"))
+        side.addLayout(board_form)
         side.addWidget(_section("Результат"))
         side.addWidget(self.result_card)
         side.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidget(panel)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFixedWidth(340)
 
         root = QWidget()
         layout = QHBoxLayout(root)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(12)
         layout.addWidget(self.plan, stretch=1)
-        layout.addWidget(panel)
+        layout.addWidget(scroll)
         self.setCentralWidget(root)
 
         self._coords = QLabel()
@@ -487,12 +539,52 @@ class MainWindow(QMainWindow):
         self.plan.cursor_moved.connect(self._show_cursor)
         self.pile_step.valueChanged.connect(self._on_pile_step)
         self.live_load.valueChanged.connect(self._recalculate)
+        for combo in (self.perimeter_profile, self.internal_profile, self.steel):
+            combo.currentIndexChanged.connect(self._recalculate)
+        self.board_format.currentIndexChanged.connect(self._on_board_format)
+        for field in self.board_fields.values():
+            field.edited.connect(self._recalculate)
+        self._on_board_format()
 
         self._theme_mode = "system"
         self.set_theme_mode(str(_settings().value("theme", "system")))
         self.set_tool("contour")
 
     # --- панели и меню ---------------------------------------------------------------
+
+    @staticmethod
+    def _form() -> QFormLayout:
+        form = QFormLayout()
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(8)
+        return form
+
+    def _fill_profiles(self) -> None:
+        for combo in (self.perimeter_profile, self.internal_profile):
+            current = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems([section.name for section in self.catalog.sections])
+            if current:
+                combo.setCurrentText(current)
+            combo.blockSignals(False)
+
+    def _open_profiles(self) -> None:
+        theme = resolve_theme(self._theme_mode)
+        ProfilesDialog(self.catalog, theme, self).exec()
+        _settings().setValue("profiles", self.catalog.to_json())
+        self._fill_profiles()
+        self._recalculate()
+
+    def _on_board_format(self) -> None:
+        size = self.board_format.currentData()
+        custom = size is None
+        for key in ("length_mm", "width_mm"):
+            self.board_fields[key].editor.setEnabled(custom)
+        if not custom:
+            self.board_fields["length_mm"].set_value(size[0])
+            self.board_fields["width_mm"].set_value(size[1])
+        self._recalculate()
 
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Инструменты")
@@ -528,6 +620,8 @@ class MainWindow(QMainWindow):
         edit = self.menuBar().addMenu("Правка")
         edit.addAction(self.undo_action)
         edit.addAction(self.redo_action)
+        data = self.menuBar().addMenu("Данные")
+        data.addAction("Профили…", self._open_profiles)
         view = self.menuBar().addMenu("Вид")
         theme_menu = view.addMenu("Тема")
         self._theme_actions = QActionGroup(self)
@@ -572,6 +666,8 @@ class MainWindow(QMainWindow):
         apply_theme(self, theme)
         self.plan.set_theme(theme)
         self.result_card.set_theme(theme)
+        for field in getattr(self, "board_fields", {}).values():
+            field.set_theme(theme)
         for action in self._theme_actions.actions():
             action.setChecked(action.data() == mode)
         _settings().setValue("theme", mode)
@@ -593,9 +689,27 @@ class MainWindow(QMainWindow):
         self.editor.set_pile_step(step_mm)
         self._recalculate()
 
+    def _board(self) -> BoardSpec | None:
+        """Лист ЦСП из полей ввода; при ошибках показывает их и возвращает ``None``."""
+        values = {key: field.value() for key, field in self.board_fields.items()}
+        unreadable = {key for key, value in values.items() if value is None}
+        board = BoardSpec(**{k: (0.0 if v is None else v) for k, v in values.items()})
+        issues = {i.field: i for i in validate_board(board)}
+        for key, field in self.board_fields.items():
+            if key in unreadable:
+                field.show_issue(Issue(key, "Введите число."))
+            else:
+                field.show_issue(issues.get(key))
+        if unreadable or errors(list(issues.values())):
+            return None
+        return board
+
     def _recalculate(self) -> None:
         self.undo_action.setEnabled(self.editor.can_undo)
         self.redo_action.setEnabled(self.editor.can_redo)
+        board = self._board()
+        if board is None:
+            return  # в исходных данных ошибка: последний результат остаётся на экране
         contour = self.editor.contour
         if contour is None or not self.editor.piles:
             self.plan.show_design(None)
@@ -607,6 +721,10 @@ class MainWindow(QMainWindow):
                 piles=self.editor.piles,
                 pile_step_mm=self.pile_step.value(),
                 live_load_kpa=self.live_load.value(),
+                perimeter_section=self.catalog.get(self.perimeter_profile.currentText()),
+                internal_section=self.catalog.get(self.internal_profile.currentText()),
+                steel=STEELS[self.steel.currentText()],
+                board=board,
             )
         )
         self.plan.show_design(design)

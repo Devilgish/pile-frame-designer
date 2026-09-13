@@ -93,3 +93,33 @@ def test_dragging_a_pile_moves_it_and_ctrl_z_puts_it_back(qtbot):
     QTest.keyClick(window.plan, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
     assert (2000, 2000) in window.editor.piles
     assert (2000, 2500) not in window.editor.piles
+
+
+def _window_with_rectangle(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _drag(window.plan, (0, 0), (6000, 4000))
+    return window
+
+
+def test_choosing_heavier_internal_profile_recalculates_result(qtbot):
+    window = _window_with_rectangle(qtbot)
+    assert window.result_card.value("Прочность") == "54%"
+
+    window.internal_profile.setCurrentText("120×120×5")
+
+    assert window.result_card.value("Прочность") == "27%"
+
+
+def test_zero_board_thickness_shows_error_next_to_field_and_keeps_last_result(qtbot):
+    window = _window_with_rectangle(qtbot)
+    field = window.board_fields["thickness_mm"]
+
+    field.editor.clear()
+    QTest.keyClicks(field.editor, "0")
+    QTest.keyClick(field.editor, Qt.Key.Key_Return)
+
+    assert field.issue_label.isVisibleTo(window)
+    assert "больше нуля" in field.issue_label.text()
+    assert window.result_card.value("Прочность") == "54%"
