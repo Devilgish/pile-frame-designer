@@ -68,3 +68,15 @@ def test_every_sheet_edge_inside_the_contour_rests_on_a_beam(contour, long_side,
                 unsupported.append((round(point.x), round(point.y)))
 
     assert unsupported == []
+
+
+def test_reactions_balance_floor_and_steel_weight_on_an_l_shape_with_joint_beams():
+    # Равновесие на неправильном плане: вырез даёт непрямоугольные ячейки.
+    # Полная расчётная нагрузка = площадь пола · (ЦСП·1,2 + временная·1,2) + вес металла · 1,05.
+    project = Project(contour=L_SHAPE, pile_step_mm=2000, live_load_kpa=4.0)
+    design = analyze(project)
+
+    floor = 18.0 * (0.306072 * 1.2 + 4.0 * 1.2)  # кН, площадь Г-контура 18 м²
+    steel = sum(m.length_mm / 1e3 * m.section.mass_kg_m * 9.81e-3 * 1.05 for m in design.members)
+
+    assert sum(design.reactions_kn.values()) == pytest.approx(floor + steel, rel=1e-6)
