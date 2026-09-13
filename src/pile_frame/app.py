@@ -21,6 +21,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -37,6 +38,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from shapely.geometry import box
 
 from pile_frame.boards import GOST_FORMATS_MM, BoardSpec, validate_board
 from pile_frame.contour import Contour, ContourError, Point
@@ -98,6 +100,7 @@ class PlanView(QGraphicsView):
         self.editor = editor
         self.grid_step_mm = DEFAULT_GRID_STEP_MM
         self.tool = "contour"
+        self.show_sheets = True
         self._area = QRectF(-PLAN_MARGIN_MM, -PLAN_MARGIN_MM, 13000, 10000)
         self._scene = QGraphicsScene(self._area)
         self.setScene(self._scene)
@@ -157,6 +160,8 @@ class PlanView(QGraphicsView):
             polygon = QPolygonF([QPointF(x, y) for x, y in self.editor.contour.vertices])
             self._scene.addPolygon(polygon, QPen(QColor(self._theme.outline), 0))
         if self._design is not None:
+            if self.show_sheets:
+                self._draw_sheets(self._design)
             self._draw_members(self._design)
         self._draw_piles()
         self._draw_preview()
@@ -174,6 +179,30 @@ class PlanView(QGraphicsView):
             pen = major if y % GRID_MAJOR_MM == 0 else minor
             self._scene.addLine(area.left(), y, area.right(), y, pen)
             y += step
+
+    def set_show_sheets(self, visible: bool) -> None:
+        self.show_sheets = visible
+        self._redraw()
+
+    def _draw_sheets(self, design: Design) -> None:
+        """Листы: заливка кусков внутри контура, резаные — со штриховкой."""
+        layout, contour = design.sheet_layout, self.editor.contour
+        if layout is None or contour is None:
+            return
+        t = self._theme
+        fill = QColor(t.sheet_fill)
+        edge = QPen(QColor(t.sheet_cut), 0)
+        hatch = QBrush(QColor(t.sheet_cut), Qt.BrushStyle.BDiagPattern)
+        hatch.setTransform(hatch.transform().scale(1 / PLAN_SCALE, 1 / PLAN_SCALE))
+        for sheet in layout.sheets:
+            piece = contour.polygon.intersection(box(sheet.x0, sheet.y0, sheet.x1, sheet.y1))
+            for part in getattr(piece, "geoms", [piece]):
+                if part.geom_type != "Polygon":
+                    continue
+                polygon = QPolygonF([QPointF(x, y) for x, y in part.exterior.coords])
+                self._scene.addPolygon(polygon, edge, QBrush(fill))
+                if not sheet.whole:
+                    self._scene.addPolygon(polygon, QPen(Qt.PenStyle.NoPen), hatch)
 
     def _draw_members(self, design: Design) -> None:
         t = self._theme
@@ -331,6 +360,8 @@ class ResultCard(QFrame):
         "Балка",
         "Прочность",
         "Прогиб",
+        "Листы",
+        "Обрезки",
         "Замечания",
     )
 
@@ -399,6 +430,10 @@ class ResultCard(QFrame):
         if design.corners_without_piles:
             notes.append(f"углов без свай: {len(design.corners_without_piles)}")
         v["Замечания"].setText(", ".join(notes) if notes else "нет")
+        layout = design.sheet_layout
+        if layout is not None:
+            v["Листы"].setText(f"{layout.whole_count} целых, {layout.cut_count} резаных")
+            v["Обрезки"].setText(f"{_fmt(layout.offcut_m2)} м²")
         self._refresh_status_style()
 
     def clear(self) -> None:
@@ -477,6 +512,14 @@ class MainWindow(QMainWindow):
         self.board_format.setCurrentIndex(
             GOST_FORMATS_MM.index((defaults.length_mm, defaults.width_mm))
         )
+        self.sheet_long_side = QComboBox()
+        self.sheet_long_side.addItem("длинной стороной вдоль X", "x")
+        self.sheet_long_side.addItem("длинной стороной вдоль Y", "y")
+        self.sheet_fields = {
+            "offset_x": NumberField(0, "мм"),
+            "offset_y": NumberField(0, "мм"),
+            "gap": NumberField(3, "мм"),
+        }
         self.board_fields = {
             "length_mm": NumberField(defaults.length_mm, "мм"),
             "width_mm": NumberField(defaults.width_mm, "мм"),
@@ -494,6 +537,10 @@ class MainWindow(QMainWindow):
         board_form.addRow("Ширина", self.board_fields["width_mm"])
         board_form.addRow("Толщина", self.board_fields["thickness_mm"])
         board_form.addRow("Плотность", self.board_fields["density_kg_m3"])
+        board_form.addRow("Листы", self.sheet_long_side)
+        board_form.addRow("Смещение X", self.sheet_fields["offset_x"])
+        board_form.addRow("Смещение Y", self.sheet_fields["offset_y"])
+        board_form.addRow("Зазор", self.sheet_fields["gap"])
         load_form = self._form()
         load_form.addRow("Шаг свай", self.pile_step)
         load_form.addRow("Временная нагрузка", self.live_load)
@@ -503,14 +550,14 @@ class MainWindow(QMainWindow):
         side = QVBoxLayout(panel)
         side.setContentsMargins(0, 0, 8, 0)
         side.setSpacing(8)
+        side.addWidget(_section("Результат"))
+        side.addWidget(self.result_card)
         side.addWidget(_section("Сваи и нагрузка"))
         side.addLayout(load_form)
         side.addWidget(_section("Каркас"))
         side.addLayout(frame_form)
         side.addWidget(_section("Пол: ЦСП, ГОСТ 26816-2016"))
         side.addLayout(board_form)
-        side.addWidget(_section("Результат"))
-        side.addWidget(self.result_card)
         side.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidget(panel)
@@ -542,7 +589,8 @@ class MainWindow(QMainWindow):
         for combo in (self.perimeter_profile, self.internal_profile, self.steel):
             combo.currentIndexChanged.connect(self._recalculate)
         self.board_format.currentIndexChanged.connect(self._on_board_format)
-        for field in self.board_fields.values():
+        self.sheet_long_side.currentIndexChanged.connect(self._recalculate)
+        for field in [*self.board_fields.values(), *self.sheet_fields.values()]:
             field.edited.connect(self._recalculate)
         self._on_board_format()
 
@@ -615,6 +663,11 @@ class MainWindow(QMainWindow):
             lambda _: self.plan.set_grid_step(self.grid_step.currentData())
         )
         toolbar.addWidget(self.grid_step)
+        toolbar.addSeparator()
+        self.sheets_visible = QCheckBox("Листы")
+        self.sheets_visible.setChecked(True)
+        self.sheets_visible.toggled.connect(self.plan.set_show_sheets)
+        toolbar.addWidget(self.sheets_visible)
 
     def _build_menu(self) -> None:
         edit = self.menuBar().addMenu("Правка")
@@ -666,7 +719,9 @@ class MainWindow(QMainWindow):
         apply_theme(self, theme)
         self.plan.set_theme(theme)
         self.result_card.set_theme(theme)
-        for field in getattr(self, "board_fields", {}).values():
+        fields = [*getattr(self, "board_fields", {}).values()]
+        fields += [*getattr(self, "sheet_fields", {}).values()]
+        for field in fields:
             field.set_theme(theme)
         for action in self._theme_actions.actions():
             action.setChecked(action.data() == mode)
@@ -689,6 +744,23 @@ class MainWindow(QMainWindow):
         self.editor.set_pile_step(step_mm)
         self._recalculate()
 
+    def _sheet_params(self) -> tuple[tuple[float, float], float] | None:
+        """Смещение сетки листов и зазор; при ошибке показывает её под полем."""
+        values = {key: field.value() for key, field in self.sheet_fields.items()}
+        ok = True
+        for key, field in self.sheet_fields.items():
+            if values[key] is None:
+                field.show_issue(Issue(key, "Введите число."))
+                ok = False
+            elif key == "gap" and values[key] < 0:
+                field.show_issue(Issue(key, "Зазор не может быть отрицательным."))
+                ok = False
+            else:
+                field.show_issue(None)
+        if not ok:
+            return None
+        return (values["offset_x"], values["offset_y"]), values["gap"]
+
     def _board(self) -> BoardSpec | None:
         """Лист ЦСП из полей ввода; при ошибках показывает их и возвращает ``None``."""
         values = {key: field.value() for key, field in self.board_fields.items()}
@@ -707,8 +779,8 @@ class MainWindow(QMainWindow):
     def _recalculate(self) -> None:
         self.undo_action.setEnabled(self.editor.can_undo)
         self.redo_action.setEnabled(self.editor.can_redo)
-        board = self._board()
-        if board is None:
+        board, sheets = self._board(), self._sheet_params()
+        if board is None or sheets is None:
             return  # в исходных данных ошибка: последний результат остаётся на экране
         contour = self.editor.contour
         if contour is None or not self.editor.piles:
@@ -725,6 +797,9 @@ class MainWindow(QMainWindow):
                 internal_section=self.catalog.get(self.internal_profile.currentText()),
                 steel=STEELS[self.steel.currentText()],
                 board=board,
+                sheet_long_side=self.sheet_long_side.currentData(),
+                sheet_offset_mm=sheets[0],
+                sheet_gap_mm=sheets[1],
             )
         )
         self.plan.show_design(design)

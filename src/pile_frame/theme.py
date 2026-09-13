@@ -31,6 +31,8 @@ class Theme:
     member_perimeter: str
     member_internal: str
     pile: str
+    sheet_fill: str
+    sheet_cut: str
     outline: str
 
 
@@ -54,6 +56,8 @@ LIGHT = Theme(
     member_perimeter="#1E3A5F",
     member_internal="#475569",
     pile="#C2410C",
+    sheet_fill="#E6EDF6",
+    sheet_cut="#94A3B8",
     outline="#2563EB",
 )
 
@@ -77,6 +81,8 @@ DARK = Theme(
     member_perimeter="#CBD5E1",
     member_internal="#94A3B8",
     pile="#FB923C",
+    sheet_fill="#1B2940",
+    sheet_cut="#52627A",
     outline="#60A5FA",
 )
 

@@ -125,3 +125,17 @@ def test_zero_board_thickness_shows_error_next_to_field_and_keeps_last_result(qt
     assert field.issue_label.isVisibleTo(window)
     assert "больше нуля" in field.issue_label.text()
     assert window.result_text() == before
+
+
+def test_rotating_sheets_changes_layout_and_rebuilds_frame(qtbot):
+    # 6000 × 4000, листы 3200 × 1250 с зазором 3 мм.
+    # Вдоль X: 2 столбца (кусок 2797) × 4 ряда (кусок 241) → 3 целых, 5 резаных.
+    # Вдоль Y: 5 столбцов (кусок 988) × 2 ряда (кусок 797) → 4 целых, 6 резаных.
+    window = _window_with_rectangle(qtbot)
+    assert window.result_card.value("Листы") == "3 целых, 5 резаных"
+    members_before = window.result_card.value("Не проходят").split(" из ")[1]
+
+    window.sheet_long_side.setCurrentIndex(1)
+
+    assert window.result_card.value("Листы") == "4 целых, 6 резаных"
+    assert window.result_card.value("Не проходят").split(" из ")[1] != members_before
