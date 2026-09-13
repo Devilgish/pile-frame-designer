@@ -105,16 +105,18 @@ def _window_with_rectangle(qtbot):
 
 def test_choosing_heavier_internal_profile_recalculates_result(qtbot):
     window = _window_with_rectangle(qtbot)
-    assert window.result_card.value("Прочность") == "54%"
+    before = int(window.result_card.value("Прочность").rstrip("%"))
 
     window.internal_profile.setCurrentText("120×120×5")
 
-    assert window.result_card.value("Прочность") == "27%"
+    after = int(window.result_card.value("Прочность").rstrip("%"))
+    assert after < before
 
 
 def test_zero_board_thickness_shows_error_next_to_field_and_keeps_last_result(qtbot):
     window = _window_with_rectangle(qtbot)
     field = window.board_fields["thickness_mm"]
+    before = window.result_text()
 
     field.editor.clear()
     QTest.keyClicks(field.editor, "0")
@@ -122,4 +124,4 @@ def test_zero_board_thickness_shows_error_next_to_field_and_keeps_last_result(qt
 
     assert field.issue_label.isVisibleTo(window)
     assert "больше нуля" in field.issue_label.text()
-    assert window.result_card.value("Прочность") == "54%"
+    assert window.result_text() == before

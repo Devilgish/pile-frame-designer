@@ -13,7 +13,10 @@ L_SHAPE = Contour.from_points(
 
 
 def _project(contour, piles=None):
-    return Project(contour=contour, pile_step_mm=2000, live_load_kpa=4.0, piles=piles)
+    # Каркас только по сваям: здесь проверяется логика балок по сваям и контуру.
+    return Project(
+        contour=contour, pile_step_mm=2000, live_load_kpa=4.0, piles=piles, sheet_joints=False
+    )
 
 
 def test_auto_piles_fill_l_shape_on_axes_through_every_corner():

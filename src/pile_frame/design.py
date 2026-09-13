@@ -12,6 +12,7 @@ from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour, Point
 from pile_frame.materials import C245, Steel
 from pile_frame.sections import Section, TUBE_120x60x4, TUBE_120x120x5
+from pile_frame.sheets import LongSide, SheetLayout, layout_sheets
 
 GRAVITY = 9.81  # м/с²
 
@@ -43,6 +44,11 @@ class Project:
     internal_section: Section = TUBE_120x60x4
     steel: Steel = C245
     board: BoardSpec = field(default_factory=BoardSpec)
+    sheet_long_side: LongSide = "x"
+    sheet_offset_mm: tuple[float, float] = (0.0, 0.0)
+    sheet_gap_mm: float = 3.0
+    #: Ставить балки под стыками листов. Выключается, чтобы рассмотреть каркас только по сваям.
+    sheet_joints: bool = True
 
     @property
     def outline(self) -> Contour:
@@ -86,6 +92,7 @@ class Design:
     piles_outside: list[Point] = field(default_factory=list)
     corners_without_piles: list[Point] = field(default_factory=list)
     unsupported_members: list[Member] = field(default_factory=list)
+    sheet_layout: SheetLayout | None = None
 
     def failing_members(self) -> list[Member]:
         """Элементы, не прошедшие проверку, и балки без опоры на одном из концов."""
@@ -178,12 +185,88 @@ def _tributary_width(contour: Contour, segment: tuple[Point, Point], others) -> 
     return (distances[-1] + distances[1]) / 2
 
 
+def _parts(geometry) -> list[LineString]:
+    """Отрезки линии внутри многоугольника (пересечение может распасться на части)."""
+    parts = getattr(geometry, "geoms", [geometry])
+    return [g for g in parts if isinstance(g, LineString) and g.length > 0]
+
+
+def _joint_members(
+    contour: Contour,
+    joints: tuple[list[float], list[float]],
+    existing: list[tuple[Point, Point]],
+    cover_mm: float,
+) -> list[tuple[Point, Point]]:
+    """Промежуточные балки под стыками листов, где рядом нет балки по сваям.
+
+    Балка идёт по линии стыка внутри контура и делится на пролёты перпендикулярными
+    балками и стыками. Отрезок не нужен, если параллельная балка ближе ``cover_mm``.
+    """
+    polygon = contour.polygon
+    min_x, min_y, max_x, max_y = polygon.bounds
+    joints_x, joints_y = joints
+    segments: list[tuple[Point, Point]] = []
+    for axis, positions, crossing in ((0, joints_x, joints_y), (1, joints_y, joints_x)):
+        along = 1 - axis  # вдоль линии стыка меняется эта координата
+        for c in positions:
+            if axis == 0:
+                line = LineString([(c, min_y - 1), (c, max_y + 1)])
+            else:
+                line = LineString([(min_x - 1, c), (max_x + 1, c)])
+            for part in _parts(polygon.intersection(line)):
+                ends = sorted(p[along] for p in part.coords)
+                low, high = ends[0], ends[-1]
+                cuts = {low, high}
+                for a, b in existing:
+                    if abs(a[along] - b[along]) > LINE_TOLERANCE_MM:
+                        continue  # не перпендикулярна линии стыка
+                    lo, hi = sorted((a[axis], b[axis]))
+                    if lo <= c <= hi and low < a[along] < high:
+                        cuts.add(a[along])
+                beams_across = set(cuts)
+                # Стык режет балку, только если рядом нет перпендикулярной балки (она уже опора).
+                cuts |= {
+                    t
+                    for t in crossing
+                    if low < t < high and all(abs(t - b) > cover_mm for b in beams_across)
+                }
+                points = sorted(cuts)
+                for t0, t1 in zip(points, points[1:], strict=False):
+                    mid = (t0 + t1) / 2
+                    covered = False
+                    for a, b in existing:
+                        if abs(a[axis] - b[axis]) > LINE_TOLERANCE_MM:
+                            continue  # не параллельна
+                        lo, hi = sorted((a[along], b[along]))
+                        if abs(a[axis] - c) <= cover_mm and lo <= mid <= hi:
+                            covered = True
+                            break
+                    if covered:
+                        continue
+                    if axis == 0:
+                        segments.append(((c, t0), (c, t1)))
+                    else:
+                        segments.append(((t0, c), (t1, c)))
+    return segments
+
+
 def _members(
-    contour: Contour, piles: list[Point], perimeter_section: Section, internal_section: Section
+    contour: Contour,
+    piles: list[Point],
+    perimeter_section: Section,
+    internal_section: Section,
+    layout: SheetLayout | None = None,
 ) -> list[Member]:
-    """Балки каркаса в одной плоскости: периметр 120×120 и внутренние 120×60."""
+    """Балки каркаса в одной плоскости: периметр, балки по сваям и под стыками листов."""
     perimeter = _perimeter_members(contour, piles)
     internal = _internal_members(contour, piles)
+    if layout is not None:
+        internal += _joint_members(
+            contour,
+            (layout.joints_x, layout.joints_y),
+            perimeter + internal,
+            internal_section.width_mm / 2,
+        )
     everything = perimeter + internal
     return [
         Member(a, b, section, _tributary_width(contour, (a, b), everything))
@@ -215,7 +298,20 @@ def analyze(project: Project) -> Design:
     )
     outside = [p for p in piles if not contour.covers(p)]
     supports = [p for p in piles if contour.covers(p)]
-    members = _members(contour, supports, project.perimeter_section, project.internal_section)
+    layout = layout_sheets(
+        contour,
+        project.board,
+        long_side=project.sheet_long_side,
+        offset_mm=project.sheet_offset_mm,
+        gap_mm=project.sheet_gap_mm,
+    )
+    members = _members(
+        contour,
+        supports,
+        project.perimeter_section,
+        project.internal_section,
+        layout if project.sheet_joints else None,
+    )
     corners = [
         v
         for v in contour.vertices
@@ -244,4 +340,5 @@ def analyze(project: Project) -> Design:
         piles_outside=outside,
         corners_without_piles=corners,
         unsupported_members=unsupported,
+        sheet_layout=layout,
     )
