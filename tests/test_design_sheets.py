@@ -5,6 +5,7 @@ from shapely.geometry import LineString, box
 
 from pile_frame.contour import Contour
 from pile_frame.design import Project, analyze
+from pile_frame.sections import Section
 
 L_SHAPE = Contour.from_points(
     [(0, 0), (6000, 0), (6000, 2000), (3000, 2000), (3000, 4000), (0, 4000)]
@@ -94,3 +95,46 @@ def test_reactions_balance_floor_and_steel_weight_on_an_l_shape(project):
     steel = sum(m.length_mm / 1e3 * m.section.mass_kg_m * 9.81e-3 * 1.05 for m in design.members)
 
     assert sum(design.reactions_kn.values()) == pytest.approx(floor + steel, rel=1e-6)
+
+
+def test_thin_walled_internal_beams_fail_by_web_stability_not_by_strength():
+    # 250×100×2: λw = (246/2)·√(240/206 000) = 4,20 > 3,5.
+    # Wx взят большим, чтобы прочность проходила.
+    thin = Section("250×100×2", 250, 100, 2, 7.8, 9.8, 1500.0, 120.0)
+    design = analyze(
+        Project(
+            width_mm=6000,
+            length_mm=4000,
+            pile_step_mm=2000,
+            live_load_kpa=4.0,
+            internal_section=thin,
+            sheet_joints=False,
+        )
+    )
+
+    thin_checks = [
+        c for m, c in zip(design.members, design.checks, strict=True) if m.section == thin
+    ]
+    assert thin_checks
+    assert all(c.strength_ok and c.web_utilization > 1 and not c.passed for c in thin_checks)
+
+
+def test_welds_are_checked_where_joint_beams_meet_other_beams():
+    # 6400 × 2500, сваи через 3200: балка под стыком y = 1251,5 примыкает к периметру x = 0 и
+    # x = 6400 и к балке по сваям x = 3200 → три узла со швами.
+    design = analyze(Project(contour=_rectangle(6400, 2500), pile_step_mm=3200, live_load_kpa=4.0))
+
+    points = sorted((round(w.point[0]), round(w.point[1])) for w in design.welds)
+    assert points == [(0, 1252), (3200, 1252), (6400, 1252)]
+    assert all(0 < w.check.utilization < 1 for w in design.welds)
+    assert design.electrode_issue is None
+
+
+def test_unsuitable_electrode_is_reported():
+    design = analyze(
+        Project(
+            contour=_rectangle(6400, 2500), pile_step_mm=3200, live_load_kpa=4.0, electrode="Э42"
+        )
+    )
+
+    assert "14.1.8" in design.electrode_issue

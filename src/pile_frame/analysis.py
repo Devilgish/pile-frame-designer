@@ -20,6 +20,8 @@ from pile_frame.floor_load import Profile, distribute_floor
 from pile_frame.grillage import Grillage
 from pile_frame.materials import STEEL_E_MPA
 from pile_frame.sections import Section
+from pile_frame.stability import check_local_stability
+from pile_frame.welds import WeldCheck, check_weld
 
 if TYPE_CHECKING:
     from pile_frame.design import Member, Project
@@ -61,6 +63,8 @@ class MemberCheck:
     deflection_limit_mm: float
     max_moment_knm: float
     max_shear_kn: float
+    web_utilization: float = 0.0
+    flange_utilization: float = 0.0
 
     @property
     def deflection_utilization(self) -> float:
@@ -68,7 +72,13 @@ class MemberCheck:
 
     @property
     def utilization(self) -> float:
-        return max(self.strength_utilization, self.shear_utilization, self.deflection_utilization)
+        return max(
+            self.strength_utilization,
+            self.shear_utilization,
+            self.deflection_utilization,
+            self.web_utilization,
+            self.flange_utilization,
+        )
 
     @property
     def strength_ok(self) -> bool:
@@ -84,7 +94,15 @@ class MemberCheck:
 
     @property
     def passed(self) -> bool:
-        return self.strength_ok and self.shear_ok and self.deflection_ok
+        return self.utilization <= 1.0
+
+
+@dataclass(frozen=True)
+class NodeWeld:
+    """Сварное примыкание в узле пересечения балок."""
+
+    point: Point
+    check: WeldCheck
 
 
 class AnalysisError(RuntimeError):
@@ -126,8 +144,8 @@ def _clip_profile(profile: Profile, start: float, end: float) -> Profile:
 
 def analyze_frame(
     project: Project, contour: Contour, supports: list[Point], members: list[Member]
-) -> tuple[list[MemberCheck], dict[Point, float]]:
-    """Проверки для каждого элемента и реакции свай, кН."""
+) -> tuple[list[MemberCheck], dict[Point, float], list[NodeWeld]]:
+    """Проверки элементов, реакции свай (кН) и сварные примыкания в узлах."""
     profiles = distribute_floor(contour, [(m.start, m.end) for m in members])
     live_gamma = gamma_f_live(project.live_load_kpa)
     # Давление на пол, Н/мм² (1 кПа = 1e-3 Н/мм²), и коэффициент к весу металла.
@@ -140,7 +158,7 @@ def analyze_frame(
         1.0,
     )
 
-    design, sub_design, _ = _solve(members, profiles, supports, *design_combo)
+    design, sub_design, nodes_design = _solve(members, profiles, supports, *design_combo)
     deflection, _, nodes_deflection = _solve(members, profiles, supports, *deflection_combo)
 
     pile_xs = sorted({p[0] for p in supports})
@@ -165,6 +183,9 @@ def analyze_frame(
             / (section.ix_cm4 * 1e4 * 2 * section.thickness_mm)
         )
         shear = tau / (SHEAR_RATIO * ry * GAMMA_C)
+        stability = check_local_stability(
+            section, ry_mpa=ry, sigma_c_mpa=max_moment / (section.wx_cm3 * 1e3 * GAMMA_C)
+        )
 
         worst: tuple[float, float] | None = None  # прогиб и предел в худшей точке
         for node, point in nodes_deflection[index]:
@@ -183,6 +204,8 @@ def analyze_frame(
                 deflection_limit_mm=worst[1],
                 max_moment_knm=max_moment / 1e6,
                 max_shear_kn=max_shear / 1e3,
+                web_utilization=stability.web_utilization,
+                flange_utilization=stability.flange_utilization,
             )
         )
 
@@ -190,7 +213,29 @@ def analyze_frame(
     for pile in supports:
         node = design.node_at(pile)
         reactions[pile] = design.reaction(node) / 1e3 if node is not None else 0.0
-    return checks, reactions
+    welds = _welds(project, members, design, nodes_design, supports)
+    return checks, reactions, welds
+
+
+def _welds(project, members, design, nodes, supports) -> list[NodeWeld]:
+    """Швы в узлах, где балки одного направления опираются на балки другого (кроме свай)."""
+    support_keys = {_key(p) for p in supports}
+    touching: dict[tuple[int, int], tuple[int, Point, list[Section]]] = {}
+    for index, member in enumerate(members):
+        for node, point in (nodes[index][0], nodes[index][-1]):
+            key = _key(point)
+            if key in support_keys:
+                continue
+            entry = touching.setdefault(key, (node, point, []))
+            entry[2].append(member.section)
+    welds = []
+    for node, point, sections in touching.values():
+        force = design.result.transfer_force(node)
+        if force <= 0:
+            continue
+        thinnest = min(sections, key=lambda s: s.thickness_mm)
+        welds.append(NodeWeld(point, check_weld(force, thinnest, project.steel, project.electrode)))
+    return sorted(welds, key=lambda w: (w.point[1], w.point[0]))
 
 
 class _Solved:

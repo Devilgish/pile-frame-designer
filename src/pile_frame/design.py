@@ -11,6 +11,7 @@ from pile_frame.analysis import (
     GRAVITY,
     AnalysisError,
     MemberCheck,
+    NodeWeld,
     analyze_frame,
     gamma_f_live,
 )
@@ -19,6 +20,7 @@ from pile_frame.contour import Contour, Point
 from pile_frame.materials import C245, Steel
 from pile_frame.sections import Section, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.sheets import LongSide, SheetLayout, layout_sheets
+from pile_frame.welds import DEFAULT_ELECTRODE, electrode_issue
 
 __all__ = ["GRAVITY", "AnalysisError", "gamma_f_live"]
 
@@ -46,6 +48,8 @@ class Project:
     sheet_gap_mm: float = 3.0
     #: Ставить балки под стыками листов. Выключается, чтобы рассмотреть каркас только по сваям.
     sheet_joints: bool = True
+    #: Электрод для ручной сварки примыканий (таблица Г.2).
+    electrode: str = DEFAULT_ELECTRODE
 
     @property
     def outline(self) -> Contour:
@@ -86,6 +90,8 @@ class Design:
     governing_member: Member
     governing_check: MemberCheck
     reactions_kn: dict[Point, float] = field(default_factory=dict)
+    welds: list[NodeWeld] = field(default_factory=list)
+    electrode_issue: str | None = None
     piles_outside: list[Point] = field(default_factory=list)
     corners_without_piles: list[Point] = field(default_factory=list)
     unsupported_members: list[Member] = field(default_factory=list)
@@ -291,7 +297,9 @@ def analyze(project: Project) -> Design:
         if not any(math.dist(v, p) <= LINE_TOLERANCE_MM for p in supports)
     ]
     unsupported = [m for m in members if m.start in corners or m.end in corners]
-    checks, reactions = analyze_frame(project, contour, supports, members)
+    checks, reactions, welds = analyze_frame(project, contour, supports, members)
+    thickness = min((m.section.thickness_mm for m in members), default=4.0)
+    issue = electrode_issue(project.steel, project.electrode, thickness_mm=thickness)
     check, member = max(zip(checks, members, strict=True), key=lambda cm: cm[0].utilization)
     return Design(
         piles=piles,
@@ -300,6 +308,8 @@ def analyze(project: Project) -> Design:
         governing_member=member,
         governing_check=check,
         reactions_kn=reactions,
+        welds=welds,
+        electrode_issue=issue,
         piles_outside=outside,
         corners_without_piles=corners,
         unsupported_members=unsupported,
