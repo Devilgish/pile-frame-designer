@@ -12,28 +12,39 @@ STEEL_E_MPA = 2.06e5
 class Steel:
     """Сталь с расчётным сопротивлением Ry по толщине проката.
 
-    ``ranges`` — строки таблицы: (толщина от, толщина до включительно, Ry), мм и Н/мм².
+    ``ranges`` — строки таблицы: (толщина от, до включительно, Ry, Run), мм и Н/мм².
     Для гнутых профилей Ry принимается как для листового проката (п. 6.2), таблица В.3.
     """
 
     name: str
-    ranges: tuple[tuple[float, float, float], ...]
+    ranges: tuple[tuple[float, float, float, float], ...]
 
-    def ry_mpa(self, thickness_mm: float) -> float:
-        for low, high, ry in self.ranges:
-            if low <= thickness_mm <= high:
-                return ry
+    def _row(self, thickness_mm: float) -> tuple[float, float, float, float]:
+        for row in self.ranges:
+            if row[0] <= thickness_mm <= row[1]:
+                return row
         raise ValueError(
             f"Для стали {self.name} толщина {thickness_mm:g} мм не приведена в таблице В.3 "
             "СП 16.13330.2017."
         )
 
+    def ry_mpa(self, thickness_mm: float) -> float:
+        """Расчётное сопротивление по пределу текучести, Н/мм²."""
+        return self._row(thickness_mm)[2]
+
+    def run_mpa(self, thickness_mm: float) -> float:
+        """Нормативное сопротивление по временному сопротивлению, Н/мм²."""
+        return self._row(thickness_mm)[3]
+
 
 # Таблица В.3. «Св. 10 до 20» у С255 записано как верхняя граница 20 после строки «до 10».
-C235 = Steel("С235", ((2.0, 4.0, 230),))
-C245 = Steel("С245", ((2.0, 20.0, 240),))
-C255 = Steel("С255", ((2.0, 3.9, 250), (4.0, 10.0, 240), (10.0, 20.0, 240), (20.0, 40.0, 230)))
-C355 = Steel("С355", ((2.0, 16.0, 350), (16.0, 40.0, 340)))
+C235 = Steel("С235", ((2.0, 4.0, 230, 360),))
+C245 = Steel("С245", ((2.0, 20.0, 240, 370),))
+C255 = Steel(
+    "С255",
+    ((2.0, 3.9, 250, 380), (4.0, 10.0, 240, 380), (10.0, 20.0, 240, 370), (20.0, 40.0, 230, 370)),
+)
+C355 = Steel("С355", ((2.0, 16.0, 350, 490), (16.0, 40.0, 340, 490)))
 
 #: Стали, доступные для выбора.
 STEELS = {steel.name: steel for steel in (C235, C245, C255, C355)}
