@@ -70,10 +70,24 @@ def test_every_sheet_edge_inside_the_contour_rests_on_a_beam(contour, long_side,
     assert unsupported == []
 
 
-def test_reactions_balance_floor_and_steel_weight_on_an_l_shape_with_joint_beams():
-    # Равновесие на неправильном плане: вырез даёт непрямоугольные ячейки.
+@pytest.mark.parametrize(
+    "project",
+    [
+        # Балки под стыками делят Г-контур на прямоугольные ячейки.
+        Project(contour=L_SHAPE, pile_step_mm=2000, live_load_kpa=4.0),
+        # Сваи только в шести углах, без внутренних балок: одна Г-образная (непрямоугольная) ячейка.
+        Project(
+            contour=L_SHAPE,
+            pile_step_mm=2000,
+            live_load_kpa=4.0,
+            piles=L_SHAPE.vertices,
+            sheet_joints=False,
+        ),
+    ],
+    ids=["ячейки прямоугольные", "одна Г-образная ячейка"],
+)
+def test_reactions_balance_floor_and_steel_weight_on_an_l_shape(project):
     # Полная расчётная нагрузка = площадь пола · (ЦСП·1,2 + временная·1,2) + вес металла · 1,05.
-    project = Project(contour=L_SHAPE, pile_step_mm=2000, live_load_kpa=4.0)
     design = analyze(project)
 
     floor = 18.0 * (0.306072 * 1.2 + 4.0 * 1.2)  # кН, площадь Г-контура 18 м²
