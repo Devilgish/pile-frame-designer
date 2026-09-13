@@ -80,3 +80,30 @@ def test_triangular_load_gives_handbook_moment_deflection_and_internal_moment():
     assert result.deflection(m) == pytest.approx(w * L**4 / (120 * EI))
     assert result.moment_at(left, L / 4) == pytest.approx(11 * w * L**2 / 192)
     assert result.shear_at(left, 0) == pytest.approx(w * L / 4)
+
+
+def test_transfer_force_at_crossing_is_the_share_carried_by_each_line():
+    # Балки крест-накрест, груз P в узле: каждая линия несёт P/2 — это и передаёт шов.
+    span, force = 4000.0, 10_000.0
+    g = Grillage()
+    west, east = g.node(0, 2000, support=True), g.node(span, 2000, support=True)
+    south, north = g.node(2000, 0, support=True), g.node(2000, span, support=True)
+    middle = g.node(2000, 2000)
+    g.beam(west, middle, EI)
+    g.beam(middle, east, EI)
+    g.beam(south, middle, EI)
+    g.beam(middle, north, EI)
+    g.point_load(middle, force)
+
+    result = g.solve()
+
+    assert result.transfer_force(middle) == pytest.approx(force / 2)
+
+
+def test_node_inside_a_straight_beam_transfers_nothing():
+    g = Grillage()
+    a, m, b = g.node(0, 0, support=True), g.node(L / 2, 0), g.node(L, 0, support=True)
+    for beam in (g.beam(a, m, EI), g.beam(m, b, EI)):
+        g.line_load(beam, Q)
+
+    assert g.solve().transfer_force(m) == 0.0

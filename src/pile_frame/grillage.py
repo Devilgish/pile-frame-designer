@@ -216,3 +216,22 @@ class GrillageResult:
         forces = self._end_forces(beam)
         _, load_moment = self._load_integrals(beam, s)
         return float(forces[1] - forces[0] * s - load_moment)
+
+    def transfer_force(self, node: int) -> float:
+        """Сила, которую балки одного направления передают балкам другого в узле, Н.
+
+        Балки вдоль X и вдоль Y отдают в узел вертикальные силы; меньшая по модулю из двух
+        сумм — это то, что передаётся через сварное примыкание. В узле на одной прямой — 0.
+        """
+        totals = [0.0, 0.0]
+        touched = [False, False]
+        for beam, forces in zip(self._model.beams, self._forces, strict=True):
+            if beam.i == node:
+                totals[beam.axis] += forces[0]
+                touched[beam.axis] = True
+            if beam.j == node:
+                totals[beam.axis] += forces[2]
+                touched[beam.axis] = True
+        if not all(touched):
+            return 0.0
+        return float(min(abs(totals[0]), abs(totals[1])))
