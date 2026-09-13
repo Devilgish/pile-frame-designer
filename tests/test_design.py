@@ -56,3 +56,15 @@ def test_plan_without_internal_rows_checks_perimeter_with_half_span_tributary():
 
     assert design.governing_member.section == TUBE_120x120x5
     assert design.governing_check.strength_utilization == pytest.approx(0.138, abs=0.001)
+
+
+def test_every_overstressed_member_is_reported_not_only_the_governing_one():
+    # 9000 × 6000, шаг 3000, 4,0 кПа.
+    # Внутренние 120×60 (грузовая ширина 3 м): использование ≈ 1,82 — не проходят, их 3 + 2·2 = 7.
+    # Периметр 120×120 (грузовая ширина 1,5 м): q ≈ 7,93 кН/м, σ ≈ 110 Н/мм², ≈ 0,46 — проходит.
+    design = analyze(Project(width_mm=9000, length_mm=6000, pile_step_mm=3000, live_load_kpa=4.0))
+
+    failing = design.failing_members()
+
+    assert len(failing) == 7
+    assert {m.section for m in failing} == {TUBE_120x60x4}

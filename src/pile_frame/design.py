@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from pile_frame.beam import BeamCheck, BeamLoad, check_beam
 from pile_frame.materials import C245
-from pile_frame.sections import TUBE_120x60x4, TUBE_120x120x5, Section
+from pile_frame.sections import Section, TUBE_120x60x4, TUBE_120x120x5
 
 GRAVITY = 9.81  # м/с²
 
@@ -58,8 +58,13 @@ class Design:
 
     piles: list[tuple[float, float]]
     members: list[Member]
+    checks: list[BeamCheck]
     governing_member: Member
     governing_check: BeamCheck
+
+    def failing_members(self) -> list[Member]:
+        """Элементы, не прошедшие проверку."""
+        return [m for m, c in zip(self.members, self.checks, strict=True) if not c.passed]
 
 
 def _axis(size_mm: float, step_mm: float) -> list[float]:
@@ -115,20 +120,19 @@ def analyze(project: Project) -> Design:
     ys = _axis(project.length_mm, project.pile_step_mm)
     members = _members(xs, ys)
     checks = [
-        (
-            check_beam(
-                span_mm=m.length_mm, section=m.section, steel=C245, load=_member_load(project, m)
-            ),
-            m,
+        check_beam(
+            span_mm=m.length_mm, section=m.section, steel=C245, load=_member_load(project, m)
         )
         for m in members
     ]
     check, member = max(
-        checks, key=lambda cm: max(cm[0].strength_utilization, cm[0].deflection_utilization)
+        zip(checks, members, strict=True),
+        key=lambda cm: max(cm[0].strength_utilization, cm[0].deflection_utilization),
     )
     return Design(
         piles=[(x, y) for x in xs for y in ys],
         members=members,
+        checks=checks,
         governing_member=member,
         governing_check=check,
     )
