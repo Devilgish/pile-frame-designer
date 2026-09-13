@@ -3,6 +3,7 @@
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtTest import QTest
+from PySide6.QtWidgets import QApplication
 
 from pile_frame.app import MainWindow
 from pile_frame.status import Status
@@ -53,3 +54,42 @@ def test_result_card_shows_status_as_text_and_icon(qtbot):
     assert card.status() is Status.OK
     assert card.status_text() == Status.OK.label
     assert not card.icon_pixmap().isNull()
+
+
+L_POINTS = [(0, 0), (6000, 0), (6000, 2000), (3000, 2000), (3000, 4000), (0, 4000)]
+
+
+def _click(view, point_mm):
+    QTest.mouseClick(
+        view.viewport(), Qt.MouseButton.LeftButton, pos=view.mapFromScene(QPointF(*point_mm))
+    )
+
+
+def test_clicking_vertices_draws_l_shaped_contour_with_auto_piles(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.set_tool("contour")
+
+    for point in [*L_POINTS, L_POINTS[0]]:  # клик в первую вершину замыкает контур
+        _click(window.plan, point)
+
+    assert window.plan.pile_count() == 13
+
+
+def test_dragging_a_pile_moves_it_and_ctrl_z_puts_it_back(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    qtbot.waitExposed(window)
+    _drag(window.plan, (0, 0), (4000, 4000))
+    window.set_tool("piles")
+
+    _drag(window.plan, (2000, 2000), (2000, 2500))
+    assert (2000, 2500) in window.editor.piles
+
+    window.activateWindow()
+    qtbot.waitUntil(lambda: QApplication.activeWindow() is window, timeout=1000)
+    QTest.keyClick(window.plan, Qt.Key.Key_Z, Qt.KeyboardModifier.ControlModifier)
+    assert (2000, 2000) in window.editor.piles
+    assert (2000, 2500) not in window.editor.piles
