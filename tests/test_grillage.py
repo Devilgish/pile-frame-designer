@@ -60,3 +60,23 @@ def test_two_crossing_beams_share_a_point_load_equally():
     for support in (west, east, south, north):
         assert result.reaction(support) == pytest.approx(force / 4)
     assert result.end_moments(along_x[0])[1] == pytest.approx(force / 2 * span / 4)
+
+
+def test_triangular_load_gives_handbook_moment_deflection_and_internal_moment():
+    # Однопролётная балка L с треугольной нагрузкой, пик w посередине:
+    # R = wL/4; M(L/2) = wL²/12; f(L/2) = wL⁴/(120·EI);
+    # M(s) = wLs/4 − ws³/(3L) → M(L/4) = 11·wL²/192.
+    w = 10.0
+    g = Grillage()
+    a, m, b = g.node(0, 0, support=True), g.node(L / 2, 0), g.node(L, 0, support=True)
+    left, right = g.beam(a, m, EI), g.beam(m, b, EI)
+    g.line_load(left, 0.0, w)
+    g.line_load(right, w, 0.0)
+
+    result = g.solve()
+
+    assert result.reaction(a) == pytest.approx(w * L / 4)
+    assert result.end_moments(left)[1] == pytest.approx(w * L**2 / 12)
+    assert result.deflection(m) == pytest.approx(w * L**4 / (120 * EI))
+    assert result.moment_at(left, L / 4) == pytest.approx(11 * w * L**2 / 192)
+    assert result.shear_at(left, 0) == pytest.approx(w * L / 4)

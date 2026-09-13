@@ -188,3 +188,31 @@ class GrillageResult:
         """Изгибающие моменты в начале и в конце балки, Н·мм; растянутый низ — плюс."""
         forces = self._end_forces(beam)
         return float(forces[1]), float(-forces[3])
+
+    def _load_integrals(self, beam: int, s: float) -> tuple[float, float]:
+        """Нагрузка на участке [0, s]: равнодействующая и её момент относительно точки s."""
+        force = moment = 0.0
+        for s0, s1, q0, q1 in self._model.beams[beam].loads:
+            end = min(s, s1)
+            if end <= s0:
+                continue
+            q_end = q0 + (q1 - q0) * (end - s0) / (s1 - s0)
+            length = end - s0
+            part_force = (q0 + q_end) / 2 * length
+            # Центр тяжести трапеции от s0.
+            centroid = length * (q0 + 2 * q_end) / (3 * (q0 + q_end)) if q0 + q_end else 0.0
+            force += part_force
+            moment += part_force * (s - (s0 + centroid))
+        return force, moment
+
+    def shear_at(self, beam: int, s: float) -> float:
+        """Поперечная сила в сечении s от начала балки, Н (вверх слева — плюс)."""
+        forces = self._end_forces(beam)
+        load, _ = self._load_integrals(beam, s)
+        return float(-forces[0] - load)
+
+    def moment_at(self, beam: int, s: float) -> float:
+        """Изгибающий момент в сечении s от начала балки, Н·мм; растянутый низ — плюс."""
+        forces = self._end_forces(beam)
+        _, load_moment = self._load_integrals(beam, s)
+        return float(forces[1] - forces[0] * s - load_moment)
