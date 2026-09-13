@@ -78,7 +78,7 @@ def check_beam(*, span_mm: float, section: Section, steel: Steel, load: BeamLoad
     deflection_mm = 5 * q_deflection * span_mm**4 / (384 * STEEL_E_MPA * section.ix_cm4 * 1e4)
 
     return BeamCheck(
-        strength_utilization=stress_mpa / (steel.ry_mpa * GAMMA_C),
+        strength_utilization=stress_mpa / (steel.ry_mpa(section.thickness_mm) * GAMMA_C),
         deflection_mm=deflection_mm,
         deflection_limit_mm=deflection_limit_mm(span_mm),
     )

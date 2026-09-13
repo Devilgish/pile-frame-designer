@@ -2,7 +2,9 @@
 
 import pytest
 
+from pile_frame.boards import BoardSpec
 from pile_frame.design import Project, analyze
+from pile_frame.materials import STEELS
 from pile_frame.sections import TUBE_120x60x4, TUBE_120x120x5
 
 
@@ -68,3 +70,30 @@ def test_every_overstressed_member_is_reported_not_only_the_governing_one():
 
     assert len(failing) == 7
     assert {m.section for m in failing} == {TUBE_120x60x4}
+
+
+BASE = {"width_mm": 6000, "length_mm": 4000, "pile_step_mm": 2000, "live_load_kpa": 4.0}
+
+
+def test_heavier_internal_profile_lowers_utilization():
+    # 120×120×5 вместо 120×60×4. Нагрузка: ЦСП 0,6121·1,2 + вес 17,55 кг/м·9,81 = 0,1722·1,05
+    #   + 8,0·1,2 = 10,515 кН/м; M = 5,2577 кН·м;
+    #   σ = 5,2577e6 / 80 880 = 65,01 Н/мм²; / 240 = 0,271.
+    design = analyze(Project(**BASE, internal_section=TUBE_120x120x5))
+
+    assert design.governing_check.strength_utilization == pytest.approx(0.271, abs=0.001)
+
+
+def test_stronger_steel_uses_its_design_resistance():
+    # С355, стенка 4 мм: Ry = 350 (таблица В.3). σ = 130,14 Н/мм² → 130,14 / 350 = 0,372.
+    design = analyze(Project(**BASE, steel=STEELS["С355"]))
+
+    assert design.governing_check.strength_utilization == pytest.approx(0.372, abs=0.001)
+
+
+def test_thicker_board_adds_floor_load():
+    # ЦСП 36 мм: 1300·9,81·0,036 = 0,4591 кПа · 2 = 0,9182 кН/м (γf 1,2 → 1,1019);
+    # q = 1,1019 + 0,1079 + 9,6 = 10,810 кН/м; M = 5,4049 кН·м; σ = 134,72 Н/мм²; 0,561.
+    design = analyze(Project(**BASE, board=BoardSpec(thickness_mm=36)))
+
+    assert design.governing_check.strength_utilization == pytest.approx(0.561, abs=0.001)

@@ -8,8 +8,9 @@ from dataclasses import dataclass, field
 from shapely.geometry import LineString
 
 from pile_frame.beam import BeamCheck, BeamLoad, check_beam
+from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour, Point
-from pile_frame.materials import C245
+from pile_frame.materials import C245, Steel
 from pile_frame.sections import Section, TUBE_120x60x4, TUBE_120x120x5
 
 GRAVITY = 9.81  # м/с²
@@ -38,8 +39,10 @@ class Project:
     length_mm: float | None = None
     contour: Contour | None = None
     piles: tuple[Point, ...] | None = None
-    board_thickness_mm: float = 24.0
-    board_density_kg_m3: float = 1300.0
+    perimeter_section: Section = TUBE_120x120x5
+    internal_section: Section = TUBE_120x60x4
+    steel: Steel = C245
+    board: BoardSpec = field(default_factory=BoardSpec)
 
     @property
     def outline(self) -> Contour:
@@ -54,7 +57,7 @@ class Project:
     @property
     def board_load_kpa(self) -> float:
         """Нормативная нагрузка от листов ЦСП, кПа."""
-        return self.board_density_kg_m3 * GRAVITY * self.board_thickness_mm / 1e3 / 1e3
+        return self.board.density_kg_m3 * GRAVITY * self.board.thickness_mm / 1e3 / 1e3
 
 
 @dataclass(frozen=True)
@@ -175,14 +178,16 @@ def _tributary_width(contour: Contour, segment: tuple[Point, Point], others) -> 
     return (distances[-1] + distances[1]) / 2
 
 
-def _members(contour: Contour, piles: list[Point]) -> list[Member]:
+def _members(
+    contour: Contour, piles: list[Point], perimeter_section: Section, internal_section: Section
+) -> list[Member]:
     """Балки каркаса в одной плоскости: периметр 120×120 и внутренние 120×60."""
     perimeter = _perimeter_members(contour, piles)
     internal = _internal_members(contour, piles)
     everything = perimeter + internal
     return [
         Member(a, b, section, _tributary_width(contour, (a, b), everything))
-        for segments, section in ((perimeter, TUBE_120x120x5), (internal, TUBE_120x60x4))
+        for segments, section in ((perimeter, perimeter_section), (internal, internal_section))
         for a, b in segments
     ]
 
@@ -210,7 +215,7 @@ def analyze(project: Project) -> Design:
     )
     outside = [p for p in piles if not contour.covers(p)]
     supports = [p for p in piles if contour.covers(p)]
-    members = _members(contour, supports)
+    members = _members(contour, supports, project.perimeter_section, project.internal_section)
     corners = [
         v
         for v in contour.vertices
@@ -219,7 +224,10 @@ def analyze(project: Project) -> Design:
     unsupported = [m for m in members if m.start in corners or m.end in corners]
     checks = [
         check_beam(
-            span_mm=m.length_mm, section=m.section, steel=C245, load=_member_load(project, m)
+            span_mm=m.length_mm,
+            section=m.section,
+            steel=project.steel,
+            load=_member_load(project, m),
         )
         for m in members
     ]
