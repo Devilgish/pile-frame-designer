@@ -1,12 +1,15 @@
 """Smoke-тест окна: нарисовал контур мышью → сваи, каркас и итог проверки."""
 
 import datetime
+import json
+import pathlib
 
+import pytest
 from pypdf import PdfReader
 from PySide6.QtCore import QPointF, QSettings, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from pile_frame.app import MainWindow
 from pile_frame.report import ReportMeta
@@ -284,3 +287,218 @@ def test_report_dialog_fills_the_title_and_falls_back_to_defaults(qtbot, tmp_pat
     assert meta.object_name == "Заготовочное производство"
     assert meta.author == "Сидоров С. С."
     assert meta.date == datetime.date.today()
+
+
+def _configured_window(qtbot):
+    """Окно с Г-образным контуром и нестандартными исходными данными."""
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    for point in L_POINTS:
+        _click(window.plan, point)
+    _click(window.plan, L_POINTS[0])
+    window.live_load.setValue(2.5)
+    window.steel.setCurrentText("С255")
+    window.sheet_long_side.setCurrentIndex(1)
+    return window
+
+
+def test_saved_project_reopens_with_the_same_result(qtbot, tmp_path):
+    window = _configured_window(qtbot)
+    before = window.result_text()
+    path = tmp_path / "цех.karkas"
+
+    window.save_to(path)
+    window.new_project()
+    assert window.last_design is None
+    window.open_file(path)
+
+    assert window.result_text() == before
+    assert window.live_load.value() == 2.5
+    assert window.steel.currentText() == "С255"
+    assert window.windowTitle().startswith("цех")
+    assert not window.isWindowModified()
+
+
+def test_title_marks_unsaved_changes_until_saved_or_undone(qtbot, tmp_path):
+    window = _configured_window(qtbot)
+    assert window.isWindowModified()
+
+    window.save_to(tmp_path / "план.karkas")
+    assert not window.isWindowModified()
+
+    window.live_load.setValue(3.0)
+    assert window.isWindowModified()
+    window.live_load.setValue(2.5)  # вернули как было — изменений нет
+    assert not window.isWindowModified()
+
+
+def test_file_actions_have_standard_shortcuts_and_save_as_adds_the_extension(
+    qtbot, tmp_path, monkeypatch
+):
+    window = _configured_window(qtbot)
+    shortcuts = {
+        window.new_action: "Ctrl+N",
+        window.open_action: "Ctrl+O",
+        window.save_action: "Ctrl+S",
+        window.save_as_action: "Ctrl+Shift+S",
+    }
+    for action, keys in shortcuts.items():
+        assert action.shortcut().toString() == keys
+    asked = []
+
+    def save_dialog(*args, **kwargs):
+        asked.append(args)
+        return str(tmp_path / "цех"), ""
+
+    monkeypatch.setattr("pile_frame.app.QFileDialog.getSaveFileName", save_dialog)
+    window.save_action.trigger()  # файла ещё нет — спрашивает имя
+    window.live_load.setValue(3.0)
+    window.save_action.trigger()  # теперь сохраняет молча в тот же файл
+
+    assert len(asked) == 1
+    assert window.current_file == tmp_path / "цех.karkas"
+    assert '"live_load_kpa": 3.0' in (tmp_path / "цех.karkas").read_text(encoding="utf-8")
+
+
+def test_closing_with_unsaved_changes_asks_and_can_be_cancelled(qtbot, tmp_path, monkeypatch):
+    window = _configured_window(qtbot)
+    buttons = QMessageBox.StandardButton
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: buttons.Cancel)
+
+    window.close()
+    assert window.isVisible()  # передумал — окно осталось
+
+    target = tmp_path / "перед выходом.karkas"
+    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: buttons.Save)
+    monkeypatch.setattr(
+        "pile_frame.app.QFileDialog.getSaveFileName", lambda *args, **kwargs: (str(target), "")
+    )
+    window.close()
+    assert not window.isVisible()
+    assert target.exists()
+
+
+def test_broken_file_shows_a_message_and_keeps_the_current_project(qtbot, tmp_path, monkeypatch):
+    window = _configured_window(qtbot)
+    before = window.result_text()
+    broken = tmp_path / "сломан.karkas"
+    broken.write_text('{"app": "pile-frame-designer", "format_version": 1}', encoding="utf-8")
+    messages = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text: messages.append(text))
+
+    assert not window.open_file(broken)
+
+    assert "повреждён" in messages[0]
+    assert window.result_text() == before
+    assert window.current_file is None
+
+
+def test_recent_files_menu_reopens_a_saved_project(qtbot, tmp_path):
+    window = _configured_window(qtbot)
+    path = tmp_path / "недавний.karkas"
+    window.save_to(path)
+    window.new_project()
+
+    actions = window.recent_menu.actions()
+    assert [a.text() for a in actions] == ["недавний.karkas"]
+    actions[0].trigger()
+
+    assert window.current_file == path
+    assert window.live_load.value() == 2.5
+
+
+def test_opening_a_project_reports_a_changed_result(qtbot, tmp_path, monkeypatch):
+    window = _configured_window(qtbot)
+    path = tmp_path / "старый.karkas"
+    window.save_to(path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["summary"]["max_utilization"] = 0.1  # так выглядит проект из старой версии
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information", lambda parent, title, text: shown.append(text))
+
+    window.open_file(path)
+
+    assert "отличаются от сохранённых" in shown[0]
+
+
+def test_opened_pile_step_is_used_for_the_next_contour(qtbot, tmp_path):
+    # Проект с шагом свай 3000. После открытия новый контур 6000 × 4000 получает сваи
+    # по осям x 0/3000/6000 и y 0/2000/4000 — 9 штук (при шаге 2000 было бы 12).
+    saved = _configured_window(qtbot)
+    saved.pile_step.setValue(3000)
+    path = tmp_path / "шаг.karkas"
+    saved.save_to(path)
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+
+    window.open_file(path)
+    _drag(window.plan, (0, 0), (6000, 4000))
+
+    assert window.pile_step.value() == 3000
+    assert window.plan.pile_count() == 9
+
+
+def test_open_action_asks_for_a_file(qtbot, tmp_path, monkeypatch):
+    window = _configured_window(qtbot)
+    path = tmp_path / "через меню.karkas"
+    window.save_to(path)
+    window.new_project()
+    monkeypatch.setattr(
+        "pile_frame.app.QFileDialog.getOpenFileName", lambda *args, **kwargs: (str(path), "")
+    )
+
+    window.open_action.trigger()
+
+    assert window.current_file == path
+
+
+@pytest.mark.parametrize("content", [None, b"\xff\xfe\x00binary"], ids=["нет файла", "не текст"])
+def test_unreadable_file_shows_a_message(qtbot, tmp_path, monkeypatch, content):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    path = tmp_path / "файл.karkas"
+    if content is not None:
+        path.write_bytes(content)
+    messages = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text: messages.append(text))
+
+    assert not window.open_file(path)
+    assert str(path) in messages[0]
+
+
+def test_recent_file_that_was_deleted_is_reported_and_removed(qtbot, tmp_path, monkeypatch):
+    window = _configured_window(qtbot)
+    path = tmp_path / "удалённый.karkas"
+    window.save_to(path)
+    path.unlink()
+    messages = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text: messages.append(text))
+
+    window.recent_menu.actions()[0].trigger()
+
+    assert "перемещён или удалён" in messages[0]
+    assert window.recent_menu.actions() == []
+
+
+def test_saving_to_a_folder_shows_a_message(qtbot, tmp_path, monkeypatch):
+    window = _configured_window(qtbot)
+    messages = []
+    monkeypatch.setattr(QMessageBox, "warning", lambda parent, title, text: messages.append(text))
+
+    assert not window.save_to(tmp_path)  # папка вместо файла
+    assert window.isWindowModified()
+    assert messages
+
+
+def test_opened_gost_board_format_is_selected_in_the_list(qtbot):
+    # В эталонном проекте лист 3600 × 1200 — формат по ГОСТ, а не «свой размер».
+    window = MainWindow()
+    qtbot.addWidget(window)
+
+    window.open_file(pathlib.Path(__file__).with_name("data") / "project_v1.karkas")
+
+    assert window.board_format.currentText() == "3600 × 1200 мм"
+    assert not window.board_fields["length_mm"].editor.isEnabled()

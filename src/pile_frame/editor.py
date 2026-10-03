@@ -48,6 +48,12 @@ class PlanEditor:
         self._redo.clear()
         self._state = state
 
+    def load(self, contour: Contour | None, piles: tuple[Point, ...]) -> None:
+        """Открыть план целиком (из файла или пустой): история отмены начинается заново."""
+        self._undo.clear()
+        self._redo.clear()
+        self._state = PlanState(contour, tuple(piles))
+
     def set_contour(self, contour: Contour) -> None:
         """Задать контур и расставить сваи автоматически."""
         piles = tuple(auto_piles(contour, self.pile_step_mm))

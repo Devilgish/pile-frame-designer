@@ -13,12 +13,14 @@ DEFAULT_OBJECT = "Заготовочное производство"
 
 
 class ReportDialog(QDialog):
-    """Поля титула; значения запоминаются между запусками."""
+    """Поля титула: объект из проекта, исполнитель запоминается между запусками."""
 
-    def __init__(self, parent: QWidget | None, settings: QSettings) -> None:
+    def __init__(
+        self, parent: QWidget | None, settings: QSettings, object_name: str = DEFAULT_OBJECT
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Расчётная записка")
-        self.object_name = QLineEdit(str(settings.value("report/object", DEFAULT_OBJECT)))
+        self.object_name = QLineEdit(object_name)
         self.author = QLineEdit(str(settings.value("report/author", "")))
         self.author.setPlaceholderText("Фамилия И. О.")
         buttons = QDialogButtonBox(
@@ -39,11 +41,13 @@ class ReportDialog(QDialog):
         )
 
     @staticmethod
-    def ask(parent: QWidget | None, settings: QSettings) -> ReportMeta | None:
-        """Показать диалог; ``None`` — пользователь отказался."""
-        dialog = ReportDialog(parent, settings)
+    def ask(parent: QWidget | None, settings: QSettings, object_name: str) -> ReportMeta | None:
+        """Показать диалог; ``None`` — пользователь отказался.
+
+        Объект хранится в проекте, исполнитель — в настройках программы.
+        """
+        dialog = ReportDialog(parent, settings, object_name)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        settings.setValue("report/object", dialog.object_name.text().strip())
         settings.setValue("report/author", dialog.author.text().strip())
         return dialog.meta()

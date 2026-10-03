@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import math
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, Signal
 from PySide6.QtGui import (
     QAction,
     QActionGroup,
     QBrush,
+    QCloseEvent,
     QColor,
     QKeyEvent,
     QKeySequence,
@@ -33,6 +35,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QScrollArea,
     QSpinBox,
     QSplitter,
@@ -50,11 +53,18 @@ from pile_frame.inputs import NumberField, ProfilesDialog
 from pile_frame.issues import Issue, errors
 from pile_frame.materials import C245, STEELS
 from pile_frame.pdf import write_pdf
+from pile_frame.project_file import (
+    EXTENSION,
+    ProjectFileError,
+    load_text,
+    save_text,
+    summary_note,
+)
 from pile_frame.qt_theme import THEME_MODES, apply_theme, resolve_theme, status_icon
 from pile_frame.report import Report, ReportMeta, build_report
-from pile_frame.report_dialog import ReportDialog
+from pile_frame.report_dialog import DEFAULT_OBJECT, ReportDialog
 from pile_frame.results import ResultsPanel
-from pile_frame.sections import ProfileCatalog, TUBE_120x60x4, TUBE_120x120x5
+from pile_frame.sections import ProfileCatalog, TUBE_40x40x3, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.status import Status, design_status
 from pile_frame.theme import LIGHT, Theme
 from pile_frame.welds import DEFAULT_ELECTRODE, ELECTRODES
@@ -69,6 +79,8 @@ PILE_HIT_RADIUS_MM = 250
 
 SETTINGS_ORG = "pile-frame-designer"
 SETTINGS_APP = "pile-frame-designer"
+#: Сколько последних файлов показывать в меню «Файл».
+RECENT_LIMIT = 6
 THEME_LABELS = {"system": "Как в системе", "light": "Светлая", "dark": "Тёмная"}
 TOOL_LABELS = {"contour": "Контур", "piles": "Сваи"}
 CUSTOM_FORMAT = "Свой размер"
@@ -560,6 +572,13 @@ class MainWindow(QMainWindow):
         self.results = ResultsPanel()
         self.last_design: Design | None = None
         self.last_project: Project | None = None
+        #: Открытый файл проекта, объект для титула записки и профиль перемычек из файла.
+        self.current_file: Path | None = None
+        self.object_name = DEFAULT_OBJECT
+        self._jumper_section = TUBE_40x40x3
+        #: Текст файла для текущего состояния и для сохранённого: различие — несохранённые правки.
+        self._snapshot: str | None = None
+        self._saved_snapshot: str | None = None
 
         self.catalog = ProfileCatalog.from_json(str(_settings().value("profiles", "[]")))
         self.perimeter_profile = QComboBox()
@@ -679,6 +698,7 @@ class MainWindow(QMainWindow):
         self._theme_mode = "system"
         self.set_theme_mode(str(_settings().value("theme", "system")))
         self.set_tool("contour")
+        self._mark_saved()
 
     # --- панели и меню ---------------------------------------------------------------
 
@@ -738,6 +758,17 @@ class MainWindow(QMainWindow):
         )
         self.report_action.setEnabled(False)
         self.report_action.triggered.connect(self._export_report)
+        self.new_action = QAction("Новый", self, shortcut=QKeySequence.StandardKey.New)
+        self.new_action.triggered.connect(self.new_project)
+        self.open_action = QAction("Открыть…", self, shortcut=QKeySequence.StandardKey.Open)
+        self.open_action.triggered.connect(self._open)
+        self.save_action = QAction("Сохранить", self, shortcut=QKeySequence.StandardKey.Save)
+        self.save_action.triggered.connect(self._save)
+        self.save_as_action = QAction("Сохранить как…", self)
+        self.save_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        self.save_as_action.triggered.connect(self._save_as)
+        for action in (self.save_action, self.save_as_action):
+            action.setEnabled(False)
         toolbar.addAction(self.undo_action)
         toolbar.addAction(self.redo_action)
         toolbar.addSeparator()
@@ -757,13 +788,23 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self.sheets_visible)
 
     def _build_menu(self) -> None:
+        file = self.menuBar().addMenu("Файл")
+        file.addAction(self.new_action)
+        file.addAction(self.open_action)
+        self.recent_menu = file.addMenu("Последние")
+        file.addSeparator()
+        file.addAction(self.save_action)
+        file.addAction(self.save_as_action)
+        file.addSeparator()
+        file.addAction(self.report_action)
+        file.addSeparator()
+        file.addAction("Выход", QKeySequence.StandardKey.Quit, self.close)
+        self._refresh_recent()
         edit = self.menuBar().addMenu("Правка")
         edit.addAction(self.undo_action)
         edit.addAction(self.redo_action)
         data = self.menuBar().addMenu("Данные")
         data.addAction("Профили…", self._open_profiles)
-        data.addSeparator()
-        data.addAction(self.report_action)
         view = self.menuBar().addMenu("Вид")
         theme_menu = view.addMenu("Тема")
         self._theme_actions = QActionGroup(self)
@@ -877,8 +918,10 @@ class MainWindow(QMainWindow):
             self.results.show_design(None)
             self.last_design = None
             self.last_project = None
-            self.report_action.setEnabled(False)
+            self._set_has_result(False)
             self.result_card.clear()
+            self._snapshot = None
+            self._update_title()
             return
         project = Project(
             contour=contour,
@@ -887,6 +930,7 @@ class MainWindow(QMainWindow):
             live_load_kpa=self.live_load.value(),
             perimeter_section=self.catalog.get(self.perimeter_profile.currentText()),
             internal_section=self.catalog.get(self.internal_profile.currentText()),
+            jumper_section=self._jumper_section,
             steel=STEELS[self.steel.currentText()],
             electrode=self.electrode.currentText(),
             board=board,
@@ -896,7 +940,9 @@ class MainWindow(QMainWindow):
         )
         design = analyze(project)
         self.last_project, self.last_design = project, design
-        self.report_action.setEnabled(True)
+        self._set_has_result(True)
+        self._snapshot = save_text(project, self.object_name)
+        self._update_title()
         theme = resolve_theme(self._theme_mode)
         if design.electrode_issue:
             self.electrode_issue.setText("Внимание: " + design.electrode_issue)
@@ -912,9 +958,13 @@ class MainWindow(QMainWindow):
         """Спросить титул и файл, сверстать записку по текущему результату."""
         if self.last_design is None:
             return
-        meta = ReportDialog.ask(self, _settings())
+        meta = ReportDialog.ask(self, _settings(), self.object_name)
         if meta is None:
             return
+        if meta.object_name != self.object_name:
+            self.object_name = meta.object_name
+            self._snapshot = save_text(self.last_project, self.object_name)
+            self._update_title()
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Сохранить расчётную записку",
@@ -925,6 +975,207 @@ class MainWindow(QMainWindow):
             return
         write_pdf(self.build_report(meta), path)
         self._message.setText(f"Записка сохранена: {path}")
+
+    # --- файл проекта ------------------------------------------------------------------
+
+    def _set_has_result(self, value: bool) -> None:
+        for action in (self.report_action, self.save_action, self.save_as_action):
+            action.setEnabled(value)
+
+    def _update_title(self) -> None:
+        name = self.current_file.stem if self.current_file else "Новый проект"
+        self.setWindowTitle(f"{name}[*] — Каркас на сваях")
+        self.setWindowModified(self._snapshot != self._saved_snapshot)
+
+    def _mark_saved(self) -> None:
+        self._saved_snapshot = self._snapshot
+        self._update_title()
+
+    def save_to(self, path: str | Path) -> bool:
+        """Сохранить проект в файл. ``False`` — записать не удалось (сообщение показано)."""
+        if self.last_project is None:
+            return False
+        path = Path(path)
+        try:
+            path.write_text(
+                save_text(self.last_project, self.object_name, self.last_design), encoding="utf-8"
+            )
+        except OSError as error:
+            QMessageBox.warning(self, "Не удалось сохранить", f"{path}\n{error.strerror}")
+            return False
+        self.current_file = path
+        self._mark_saved()
+        self._remember_recent(path)
+        self._message.setText(f"Проект сохранён: {path}")
+        return True
+
+    def _save(self) -> bool:
+        if self.current_file is None:
+            return self._save_as()
+        return self.save_to(self.current_file)
+
+    def _save_as(self) -> bool:
+        name = self.current_file or Path(f"{self.object_name}{EXTENSION}")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Сохранить проект", str(name), f"Проект «Каркас на сваях» (*{EXTENSION})"
+        )
+        if not path:
+            return False
+        if not path.lower().endswith(EXTENSION):
+            path += EXTENSION
+        return self.save_to(path)
+
+    def maybe_save(self) -> bool:
+        """Спросить о несохранённых правках. ``False`` — пользователь передумал."""
+        if not self.isWindowModified():
+            return True
+        buttons = QMessageBox.StandardButton
+        answer = QMessageBox.question(
+            self,
+            "Каркас на сваях",
+            "В проекте есть несохранённые изменения. Сохранить их?",
+            buttons.Save | buttons.Discard | buttons.Cancel,
+            buttons.Save,
+        )
+        if answer == buttons.Save:
+            return self._save()
+        return answer == buttons.Discard
+
+    def new_project(self) -> None:
+        if not self.maybe_save():
+            return
+        self._apply_project(None)
+        self.current_file = None
+        self.object_name = DEFAULT_OBJECT
+        self._recalculate()
+        self._mark_saved()
+
+    def _open(self) -> None:
+        if not self.maybe_save():
+            return
+        start = str(self.current_file.parent) if self.current_file else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Открыть проект", start, f"Проект «Каркас на сваях» (*{EXTENSION})"
+        )
+        if path:
+            self.open_file(path)
+
+    def open_file(self, path: str | Path) -> bool:
+        """Открыть проект. Ошибки показываются сообщением, текущий проект не меняется."""
+        path = Path(path)
+        try:
+            loaded = load_text(path.read_text(encoding="utf-8"), self.catalog)
+        except (OSError, UnicodeDecodeError) as error:
+            reason = getattr(error, "strerror", None) or "файл не читается как текст"
+            QMessageBox.warning(self, "Не удалось открыть проект", f"{path}\n{reason}")
+            return False
+        except ProjectFileError as error:
+            QMessageBox.warning(self, "Не удалось открыть проект", f"{path}\n{error}")
+            return False
+        _settings().setValue("profiles", self.catalog.to_json())
+        self._fill_profiles()
+        self._apply_project(loaded.project)
+        self.current_file = path
+        self.object_name = loaded.object_name
+        self._recalculate()
+        self._mark_saved()
+        self._remember_recent(path)
+        notes = list(loaded.notes)
+        if self.last_design is not None:
+            note = summary_note(loaded.summary, self.last_design)
+            if note:
+                notes.append(note)
+        if notes:
+            QMessageBox.information(self, "Проект открыт", "\n\n".join(notes))
+        self._message.setText(f"Открыт проект: {path}")
+        return True
+
+    def _apply_project(self, project: Project | None) -> None:
+        """Перенести исходные данные в поля, не пересчитывая и не переставляя сваи."""
+        defaults = Project(pile_step_mm=2000, live_load_kpa=4.0)
+        source = project or defaults
+        widgets = [
+            self.pile_step,
+            self.live_load,
+            self.perimeter_profile,
+            self.internal_profile,
+            self.steel,
+            self.electrode,
+            self.board_format,
+            self.sheet_long_side,
+        ]
+        for widget in widgets:
+            widget.blockSignals(True)
+        self.pile_step.setValue(round(source.pile_step_mm))
+        self.live_load.setValue(source.live_load_kpa)
+        self.perimeter_profile.setCurrentText(source.perimeter_section.name)
+        self.internal_profile.setCurrentText(source.internal_section.name)
+        self.steel.setCurrentText(source.steel.name)
+        self.electrode.setCurrentText(source.electrode)
+        board = source.board
+        size = (board.length_mm, board.width_mm)
+        # findData не сравнивает кортежи: ищем формат перебором.
+        index = next(
+            (
+                i
+                for i in range(self.board_format.count())
+                if self.board_format.itemData(i) is not None
+                and tuple(self.board_format.itemData(i)) == size
+            ),
+            -1,
+        )
+        self.board_format.setCurrentIndex(index if index >= 0 else self.board_format.count() - 1)
+        for key in ("length_mm", "width_mm"):
+            self.board_fields[key].editor.setEnabled(index < 0)
+        for key, field in self.board_fields.items():
+            field.set_value(getattr(board, key))
+        self.sheet_long_side.setCurrentIndex(self.sheet_long_side.findData(source.sheet_long_side))
+        self.sheet_fields["offset_x"].set_value(source.sheet_offset_mm[0])
+        self.sheet_fields["offset_y"].set_value(source.sheet_offset_mm[1])
+        self.sheet_fields["gap"].set_value(source.sheet_gap_mm)
+        for widget in widgets:
+            widget.blockSignals(False)
+        self._jumper_section = source.jumper_section
+        self.editor.pile_step_mm = source.pile_step_mm
+        if project is None:
+            self.editor.load(None, ())
+        else:
+            self.editor.load(project.outline, tuple(project.piles or ()))
+        self.plan.select_member(None)
+
+    def _recent(self) -> list[str]:
+        value = _settings().value("recent", [])
+        return [value] if isinstance(value, str) else list(value or [])
+
+    def _remember_recent(self, path: Path) -> None:
+        recent = [str(path)] + [p for p in self._recent() if p != str(path)]
+        _settings().setValue("recent", recent[:RECENT_LIMIT])
+        self._refresh_recent()
+
+    def _refresh_recent(self) -> None:
+        self.recent_menu.clear()
+        recent = self._recent()
+        for path in recent:
+            action = self.recent_menu.addAction(Path(path).name)
+            action.setToolTip(path)
+            action.triggered.connect(lambda _=False, p=path: self._open_recent(p))
+        self.recent_menu.setEnabled(bool(recent))
+
+    def _open_recent(self, path: str) -> None:
+        if not self.maybe_save():
+            return
+        if not Path(path).exists():
+            QMessageBox.warning(self, "Файл не найден", f"{path}\nФайл перемещён или удалён.")
+            _settings().setValue("recent", [p for p in self._recent() if p != path])
+            self._refresh_recent()
+            return
+        self.open_file(path)
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 — имя метода Qt
+        if self.maybe_save():
+            event.accept()
+        else:
+            event.ignore()
 
     def status_message(self) -> str:
         return self._message.text()
@@ -943,6 +1194,8 @@ def main() -> None:
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    if len(sys.argv) > 1:
+        window.open_file(sys.argv[1])  # двойной щелчок по файлу проекта
     sys.exit(app.exec())
 
 
