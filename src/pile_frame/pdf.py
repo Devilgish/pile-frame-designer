@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from reportlab.graphics.shapes import Circle, Drawing, Line, PolyLine, String
+from reportlab.graphics.shapes import Circle, Drawing, Line, PolyLine, Rect, String
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4
@@ -44,6 +44,8 @@ HEADER_FILL = colors.HexColor("#F1F5F9")
 FAIL = colors.HexColor("#B91C1C")
 WARNING = colors.HexColor("#B45309")
 JUMPER = colors.HexColor("#0F766E")
+ZONE = colors.HexColor("#7C3AED")
+ZONE_FILL = colors.Color(0.486, 0.227, 0.929, alpha=0.08)
 
 
 def _register_fonts() -> None:
@@ -188,9 +190,13 @@ def _column_widths(table: rp.Table, size: float = 6.8) -> list[float]:
     for i, header in enumerate(table.headers):
         words = max(pdfmetrics.stringWidth(w, FONT_BOLD, size) for w in header.split())
         values = [pdfmetrics.stringWidth(row[i], FONT, size) for row in table.rows]
+        # Слово из ячейки тоже не рвётся: «1,05» не должно переноситься по символам.
+        cell_words = [
+            pdfmetrics.stringWidth(w, FONT, size) for row in table.rows for w in row[i].split()
+        ]
         longest = max(values, default=0.0)
         need.append(max(words, longest) + CELL_PADDING)
-        floor.append(words + CELL_PADDING)
+        floor.append(max(words, *cell_words, 0.0) + CELL_PADDING)
     total = sum(need)
     if total <= FRAME_WIDTH:
         spare = (FRAME_WIDTH - total) / len(need)
@@ -215,6 +221,20 @@ def _plan(figure: rp.PlanFigure, styles) -> Drawing:
         return pad + (x - min_x) * scale, height - pad - (y - min_y) * scale
 
     drawing = Drawing(width, height)
+    for rect, _, warn in figure.zones:
+        (x0, y0), (x1, y1) = at(rect[:2]), at(rect[2:])
+        zone = Rect(
+            min(x0, x1),
+            min(y0, y1),
+            abs(x1 - x0),
+            abs(y1 - y0),
+            fillColor=ZONE_FILL,
+            strokeColor=WARNING if warn else ZONE,
+            strokeWidth=0.6,
+        )
+        if warn:
+            zone.strokeDashArray = [2, 1.5]
+        drawing.add(zone)
     outline = [c for p in [*figure.contour, figure.contour[0]] for c in at(p)]
     drawing.add(PolyLine(outline, strokeColor=RULE, strokeWidth=0.6))
     stroke = {"perimeter": 1.6, "beam": 1.0, "jumper": 0.5}
@@ -245,6 +265,31 @@ def _plan(figure: rp.PlanFigure, styles) -> Drawing:
         x, y = at(point)
         drawing.add(Circle(x, y, 1.6, fillColor=WARNING, strokeColor=None))
         drawing.add(String(x + 2, y - font - 1.5, label, fontName=FONT_BOLD, fontSize=font + 0.6))
+    # Подписи зон — поверх балок и свай, на белой подложке.
+    for rect, label, _ in figure.zones:
+        (x0, y0), (x1, y1) = at(rect[:2]), at(rect[2:])
+        text_width = pdfmetrics.stringWidth(label, FONT, 6)
+        drawing.add(
+            Rect(
+                (x0 + x1) / 2 - text_width / 2 - 1.5,
+                (y0 + y1) / 2 - 2,
+                text_width + 3,
+                8,
+                fillColor=colors.white,
+                strokeColor=None,
+            )
+        )
+        drawing.add(
+            String(
+                (x0 + x1) / 2,
+                (y0 + y1) / 2,
+                label,
+                fontName=FONT,
+                fontSize=6,
+                fillColor=ZONE,
+                textAnchor="middle",
+            )
+        )
     # Габаритные размеры над и слева от плана.
     top = height - pad + 5
     drawing.add(Line(pad, top, pad + (max_x - min_x) * scale, top, strokeColor=MUTED))

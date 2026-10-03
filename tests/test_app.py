@@ -16,6 +16,7 @@ from pile_frame.report import ReportMeta
 from pile_frame.report_dialog import ReportDialog
 from pile_frame.status import Status
 from pile_frame.theme import DARK
+from pile_frame.zones import Zone
 
 
 def _drag(view, start_mm, end_mm):
@@ -502,3 +503,72 @@ def test_opened_gost_board_format_is_selected_in_the_list(qtbot):
 
     assert window.board_format.currentText() == "3600 × 1200 мм"
     assert not window.board_fields["length_mm"].editor.isEnabled()
+
+
+def _window_with_zone(qtbot, kind="storage", rect=((0, 0), (2000, 2000))):
+    window = _window_with_rectangle(qtbot)
+    window.set_tool("zones")
+    window.zones_panel.new_kind.setCurrentIndex(window.zones_panel.new_kind.findData(kind))
+    _drag(window.plan, *rect)
+    return window
+
+
+def test_zone_tool_draws_a_zone_with_its_preset_and_recalculates(qtbot):
+    window = _window_with_rectangle(qtbot)
+    before = max(window.last_design.reactions_kn.values())
+
+    window.set_tool("zones")
+    window.zones_panel.new_kind.setCurrentIndex(window.zones_panel.new_kind.findData("storage"))
+    _drag(window.plan, (0, 0), (2000, 2000))
+
+    assert window.last_project.zones == (Zone("storage", (0.0, 0.0, 2000.0, 2000.0), 5.0),)
+    assert max(window.last_design.reactions_kn.values()) > before
+    note = window.zones_panel.note.text()
+    assert "по аналогии" in note and "технолог" in note
+
+
+def test_zone_kind_load_and_cold_room_option_are_edited_in_the_panel(qtbot):
+    window = _window_with_zone(qtbot)
+    row = window.zones_panel.rows[0]
+    assert not row.on_board.isVisibleTo(window)  # вариант камеры — только у камеры
+
+    row.kind.setCurrentIndex(row.kind.findData("cold"))
+    row = window.zones_panel.rows[0]
+    assert row.on_board.isVisibleTo(window)
+    row.load.setValue(6.5)
+    window.zones_panel.rows[0].on_board.setChecked(True)
+
+    assert window.last_project.zones[0] == Zone(
+        "cold", (0.0, 0.0, 2000.0, 2000.0), 6.5, cold_on_board=True
+    )
+    assert "камера на ЦСП" in window.result_card.value("Замечания")
+
+
+def test_overlapping_zone_is_refused_with_an_explanation(qtbot):
+    window = _window_with_zone(qtbot)
+
+    _drag(window.plan, (1000, 1000), (3000, 3000))
+
+    assert len(window.last_project.zones) == 1
+    assert "пересекается" in window.status_message()
+
+
+def test_zone_is_removed_from_the_panel(qtbot):
+    window = _window_with_zone(qtbot)
+
+    window.zones_panel.rows[0].remove.click()
+
+    assert window.last_project.zones == ()
+    assert window.zones_panel.rows == []
+
+
+def test_zones_are_saved_and_reopened(qtbot, tmp_path):
+    window = _window_with_zone(qtbot, "pastry", ((2000, 0), (4000, 2000)))
+    path = tmp_path / "зоны.karkas"
+    window.save_to(path)
+    window.new_project()
+
+    window.open_file(path)
+
+    assert window.last_project.zones == (Zone("pastry", (2000.0, 0.0, 4000.0, 2000.0), 2.0),)
+    assert len(window.zones_panel.rows) == 1

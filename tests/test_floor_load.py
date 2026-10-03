@@ -80,3 +80,22 @@ def test_zone_over_the_whole_floor_repeats_the_ordinary_envelope_for_every_beam(
 
     for i in range(len(segments)):
         assert loaded_area_mm2(zones[i][0]) == pytest.approx(loaded_area_mm2(full[i]), rel=1e-6)
+
+
+def test_zone_in_a_non_rectangular_cell_is_spread_by_its_share_of_the_cell():
+    # Г-контур только с периметром: одна непрямоугольная ячейка 18 м², нагрузка — равномерно
+    # по периметру. Зона 2000 × 2000 = 4 м² уходит на балки целиком, по своей доле площади.
+    contour = Contour.from_points(
+        [(0, 0), (6000, 0), (6000, 2000), (3000, 2000), (3000, 4000), (0, 4000)]
+    )
+    vertices = list(contour.vertices)
+    segments = list(zip(vertices, vertices[1:] + vertices[:1], strict=True))
+
+    zones = zone_profiles(contour, segments, [(0, 0, 2000, 2000)])
+    full = distribute_floor(contour, segments)
+
+    total = sum(loaded_area_mm2(zones[i][0]) for i in range(len(segments)))
+    assert total / 1e6 == pytest.approx(4.0)
+    for i in range(len(segments)):  # везде одна и та же доля 4/18
+        share = loaded_area_mm2(zones[i][0]) / loaded_area_mm2(full[i])
+        assert share == pytest.approx(4 / 18)

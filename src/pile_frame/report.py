@@ -39,6 +39,7 @@ from pile_frame.materials import STEEL_E_MPA
 from pile_frame.stability import WEB_SLENDERNESS_LIMIT
 from pile_frame.status import design_status
 from pile_frame.welds import BETA_F, BETA_Z
+from pile_frame.zones import PRESETS
 
 #: Типы элементов каркаса в порядке изложения.
 KIND_TITLES = {"perimeter": "Балка периметра", "beam": "Балка", "jumper": "Перемычка"}
@@ -118,6 +119,8 @@ class PlanFigure:
     members: tuple[PlanMember, ...]
     piles: tuple[tuple[tuple[float, float], str], ...]
     bearing: tuple[tuple[tuple[float, float], tuple[float, float]], ...]
+    #: Зоны: прямоугольник, подпись «назначение, нагрузка», нужна ли пометка-предупреждение.
+    zones: tuple[tuple[tuple[float, float, float, float], str, bool], ...] = ()
 
 
 @dataclass
@@ -400,13 +403,25 @@ def _loads_section(project: Project, design: Design) -> Section:
             f"{SP20}, таблица 7.1",
         ),
         (
-            "Временная на пол",
+            "Временная на пол вне зон" if project.zones else "Временная на пол",
             f"{num(live, 2)} кПа",
             short(live_gamma),
             f"{num(live * live_gamma, 2)} кПа",
             f"{SP20}, п. 8.2.7",
         ),
     ]
+    for zone in project.zones:
+        x0, y0, x1, y1 = zone.rect
+        p = zone.live_load_kpa
+        rows.append(
+            (
+                f"Зона «{zone.title}» {x1 - x0:.0f} × {y1 - y0:.0f} мм",
+                f"{num(p, 2)} кПа",
+                short(gamma_f_live(p)),
+                f"{num(p * gamma_f_live(p), 2)} кПа",
+                PRESETS[zone.kind].source,
+            )
+        )
     sections = []
     for kind in KIND_TITLES:
         for member in design.members:
@@ -525,12 +540,17 @@ def _input_section(project: Project, design: Design) -> Section:
             f"{_LONG_SIDE[project.sheet_long_side]}, смещение {short(offset[0])}; "
             f"{short(offset[1])} мм, зазор {short(project.sheet_gap_mm)} мм",
         ),
-        ("Временная нагрузка", f"{num(project.live_load_kpa, 2)} кПа"),
+        (
+            "Временная нагрузка вне зон" if project.zones else "Временная нагрузка",
+            f"{num(project.live_load_kpa, 2)} кПа",
+        ),
     ]
+    if project.zones:
+        rows.append(("Зон помещений", str(len(project.zones))))
     return Section("Исходные данные", [Table("Исходные данные", ("Параметр", "Значение"), rows)])
 
 
-def plan_figure(design: Design, contour) -> PlanFigure:
+def plan_figure(design: Design, contour, zones=()) -> PlanFigure:
     failing = {id(m) for m in design.failing_members()}
     members = tuple(
         PlanMember(m.start, m.end, m.kind, tables.member_label(i), id(m) in failing)
@@ -538,7 +558,10 @@ def plan_figure(design: Design, contour) -> PlanFigure:
     )
     piles = tuple((p, tables.pile_label(i)) for i, p in enumerate(design.reactions_kn))
     bearing = tuple((i.start, i.end) for i in design.bearing_issues)
-    return PlanFigure(tuple(contour.vertices), members, piles, bearing)
+    labelled = tuple(
+        (z.rect, f"{z.title}, {num(z.live_load_kpa, 2)} кПа", z.cold_on_board) for z in zones
+    )
+    return PlanFigure(tuple(contour.vertices), members, piles, bearing, labelled)
 
 
 def _scheme_section(project: Project, design: Design) -> Section:
@@ -548,7 +571,7 @@ def _scheme_section(project: Project, design: Design) -> Section:
             Paragraph(assumptions.SIMPLIFICATIONS[0]),
             Paragraph(assumptions.SIMPLIFICATIONS[1]),
             Paragraph(assumptions.SIMPLIFICATIONS[2]),
-            plan_figure(design, project.outline),
+            plan_figure(design, project.outline, project.zones),
             Paragraph(
                 "Марки элементов (Б…) и свай (С…) совпадают с таблицами записки и программы. "
                 "Перемычки показаны тонкими линиями, непроходящие элементы — пунктиром, "
@@ -585,6 +608,7 @@ def _summary_section(design: Design) -> Section:
         )
     if design.electrode_issue:
         lines.append(design.electrode_issue)
+    lines += design.remarks
     return Section("Итог", [Paragraph(line) for line in lines])
 
 

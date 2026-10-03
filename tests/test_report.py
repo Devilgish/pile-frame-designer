@@ -7,6 +7,7 @@ import pytest
 from pile_frame import assumptions
 from pile_frame.design import Project, analyze
 from pile_frame.report import Heading, PlanFigure, ReportMeta, build_report
+from pile_frame.zones import Zone
 
 META = ReportMeta(object_name="Цех", author="Исполнитель", date=datetime.date(2026, 10, 3))
 
@@ -221,3 +222,52 @@ def test_summary_repeats_the_electrode_remark():
     )
 
     assert "14.1.8" in build_report(project, analyze(project), META).summary()
+
+
+def _zoned_report():
+    project = Project(
+        width_mm=6000,
+        length_mm=4000,
+        pile_step_mm=2000,
+        live_load_kpa=1.5,
+        zones=(
+            Zone("storage", (0.0, 0.0, 2000.0, 2000.0), 5.0),
+            Zone("cold", (2000.0, 0.0, 4000.0, 2000.0), 5.0, cold_on_board=True),
+        ),
+    )
+    return build_report(project, analyze(project), META)
+
+
+def test_zones_are_listed_in_the_loads_table_with_their_sources():
+    # Вне зон 1,5 кПа · 1,3 = 1,95; склад 5,0 · 1,2 = 6,00.
+    rows = _table(_zoned_report(), "Нагрузки").rows
+
+    assert (
+        "Временная на пол вне зон",
+        "1,50 кПа",
+        "1,3",
+        "1,95 кПа",
+        "СП 20.13330.2016, п. 8.2.7",
+    ) in rows
+    storage = next(r for r in rows if r[0].startswith("Зона «Склад»"))
+    assert storage[1:4] == ("5,00 кПа", "1,2", "6,00 кПа")
+    assert "СНиП 2.01.07-85" in storage[4] and "уточнить у технолога" in storage[4]
+
+
+def test_cold_room_on_the_board_is_in_the_summary_and_zones_are_on_the_plan():
+    report = _zoned_report()
+    figure = next(b for s in report.sections for b in s.blocks if isinstance(b, PlanFigure))
+
+    assert "промерзание" in report.summary()
+    assert [label for _, label, _ in figure.zones] == [
+        "Склад, 5,00 кПа",
+        "Холодильная камера, 5,00 кПа",
+    ]
+    assert [warn for _, _, warn in figure.zones] == [False, True]
+
+
+def test_input_data_name_the_live_load_outside_zones_and_count_the_zones():
+    rows = dict(_table(_zoned_report(), "Исходные данные").rows)
+
+    assert rows["Временная нагрузка вне зон"] == "1,50 кПа"
+    assert rows["Зон помещений"] == "2"

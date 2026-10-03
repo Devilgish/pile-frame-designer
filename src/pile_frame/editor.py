@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 
 from pile_frame.contour import Contour, Point
 from pile_frame.design import auto_piles
+from pile_frame.zones import PRESETS, Rect, Zone, ZoneError, place_zone
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class PlanState:
 
     contour: Contour | None = None
     piles: tuple[Point, ...] = ()
+    zones: tuple[Zone, ...] = ()
 
 
 class PlanEditor:
@@ -34,6 +36,10 @@ class PlanEditor:
         return self._state.piles
 
     @property
+    def zones(self) -> tuple[Zone, ...]:
+        return self._state.zones
+
+    @property
     def can_undo(self) -> bool:
         return bool(self._undo)
 
@@ -48,16 +54,44 @@ class PlanEditor:
         self._redo.clear()
         self._state = state
 
-    def load(self, contour: Contour | None, piles: tuple[Point, ...]) -> None:
+    def load(
+        self, contour: Contour | None, piles: tuple[Point, ...], zones: tuple[Zone, ...] = ()
+    ) -> None:
         """Открыть план целиком (из файла или пустой): история отмены начинается заново."""
         self._undo.clear()
         self._redo.clear()
-        self._state = PlanState(contour, tuple(piles))
+        self._state = PlanState(contour, tuple(piles), tuple(zones))
 
     def set_contour(self, contour: Contour) -> None:
-        """Задать контур и расставить сваи автоматически."""
+        """Задать контур и расставить сваи автоматически; зоны обрезаются по новому контуру."""
         piles = tuple(auto_piles(contour, self.pile_step_mm))
-        self._commit(PlanState(contour, piles))
+        self._commit(PlanState(contour, piles, _fit_zones(contour, self.zones)))
+
+    def add_zone(self, rect: Rect, kind: str) -> None:
+        """Нарисовать зону. ``ZoneError`` — зону поставить нельзя, план не меняется."""
+        if self.contour is None:
+            raise ZoneError("Сначала нарисуйте контур плана.")
+        zone = place_zone(self.contour, list(self.zones), rect, kind)
+        self._commit(replace(self._state, zones=(*self.zones, zone)))
+
+    def _change_zone(self, index: int, **changes) -> None:
+        zones = list(self.zones)
+        zones[index] = replace(zones[index], **changes)
+        self._commit(replace(self._state, zones=tuple(zones)))
+
+    def set_zone_kind(self, index: int, kind: str) -> None:
+        """Сменить назначение: нагрузка становится пресетом нового назначения."""
+        self._change_zone(index, kind=kind, live_load_kpa=PRESETS[kind].load_kpa)
+
+    def set_zone_load(self, index: int, load_kpa: float) -> None:
+        self._change_zone(index, live_load_kpa=load_kpa)
+
+    def set_zone_cold_on_board(self, index: int, on_board: bool) -> None:
+        self._change_zone(index, cold_on_board=on_board)
+
+    def remove_zone(self, index: int) -> None:
+        zones = [z for i, z in enumerate(self.zones) if i != index]
+        self._commit(replace(self._state, zones=tuple(zones)))
 
     def set_pile_step(self, step_mm: float) -> None:
         """Изменить шаг и заново расставить сваи в текущем контуре."""
@@ -90,3 +124,15 @@ class PlanEditor:
         if self._redo:
             self._undo.append(self._state)
             self._state = self._redo.pop()
+
+
+def _fit_zones(contour: Contour, zones: tuple[Zone, ...]) -> tuple[Zone, ...]:
+    """Зоны, которые помещаются в новый контур (обрезанные); остальные отбрасываются."""
+    fitted: list[Zone] = []
+    for zone in zones:
+        try:
+            placed = place_zone(contour, fitted, zone.rect, zone.kind)
+        except ZoneError:
+            continue
+        fitted.append(replace(zone, rect=placed.rect))
+    return tuple(fitted)

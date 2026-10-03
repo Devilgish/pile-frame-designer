@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QToolBar,
@@ -68,6 +69,8 @@ from pile_frame.sections import ProfileCatalog, TUBE_40x40x3, TUBE_120x60x4, TUB
 from pile_frame.status import Status, design_status
 from pile_frame.theme import LIGHT, Theme
 from pile_frame.welds import DEFAULT_ELECTRODE, ELECTRODES
+from pile_frame.zones import ZoneError
+from pile_frame.zones_panel import ZonesPanel
 
 GRID_STEPS_MM = (50, 100, 250, 500)
 DEFAULT_GRID_STEP_MM = 250
@@ -82,7 +85,9 @@ SETTINGS_APP = "pile-frame-designer"
 #: Сколько последних файлов показывать в меню «Файл».
 RECENT_LIMIT = 6
 THEME_LABELS = {"system": "Как в системе", "light": "Светлая", "dark": "Тёмная"}
-TOOL_LABELS = {"contour": "Контур", "piles": "Сваи"}
+TOOL_LABELS = {"contour": "Контур", "piles": "Сваи", "zones": "Зоны"}
+#: Прозрачность заливки зоны на плане (0–255): листы и балки под ней остаются видны.
+ZONE_FILL_ALPHA = 36
 CUSTOM_FORMAT = "Свой размер"
 
 
@@ -138,6 +143,8 @@ class PlanView(QGraphicsView):
         self._vertices: list[Point] = []  # вершины рисуемого контура
         self._dragged_pile: Point | None = None
         self._selected: int | None = None
+        #: Назначение зоны, которую рисует инструмент «Зоны».
+        self.zone_kind = "prep"
         self._redraw()
 
     # --- состояние и отрисовка -------------------------------------------------------
@@ -191,6 +198,8 @@ class PlanView(QGraphicsView):
         if self._design is not None:
             if self.show_sheets:
                 self._draw_sheets(self._design)
+        self._draw_zones()
+        if self._design is not None:
             self._draw_members(self._design)
             self._draw_board_issues(self._design)
         self._draw_piles()
@@ -213,6 +222,23 @@ class PlanView(QGraphicsView):
     def set_show_sheets(self, visible: bool) -> None:
         self.show_sheets = visible
         self._redraw()
+
+    def _draw_zones(self) -> None:
+        """Зоны: прозрачная заливка, рамка и подпись «назначение, нагрузка» — не только цвет."""
+        t = self._theme
+        fill = QColor(t.zone)
+        fill.setAlpha(ZONE_FILL_ALPHA)
+        for zone in self.editor.zones:
+            x0, y0, x1, y1 = zone.rect
+            style = Qt.PenStyle.DashLine if zone.cold_on_board else Qt.PenStyle.SolidLine
+            color = t.warning if zone.cold_on_board else t.zone
+            self._scene.addRect(
+                QRectF(x0, y0, x1 - x0, y1 - y0), QPen(QColor(color), 0, style), fill
+            )
+            label = self._scene.addSimpleText(f"{zone.title}\n{_fmt(zone.live_load_kpa, 2)} кПа")
+            label.setBrush(QColor(t.text))
+            label.setFlag(label.GraphicsItemFlag.ItemIgnoresTransformations)
+            label.setPos(x0 + 60, y0 + 60)
 
     def _draw_sheets(self, design: Design) -> None:
         """Листы: заливка кусков внутри контура, резаные — со штриховкой."""
@@ -339,6 +365,8 @@ class PlanView(QGraphicsView):
         self.cursor_moved.emit(*point)
         if self.tool == "contour" and self._press is not None and point != self._press:
             self._rectangle = not self._vertices
+        if self.tool == "zones" and self._press is not None:
+            self._rectangle = point != self._press
         self._redraw()
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
@@ -348,6 +376,8 @@ class PlanView(QGraphicsView):
         self._press = None
         if self.tool == "contour":
             self._release_contour(press, point)
+        elif self.tool == "zones":
+            self._release_zone(press, point)
         else:
             self._release_piles(point)
         self._redraw()
@@ -367,6 +397,18 @@ class PlanView(QGraphicsView):
         elif not self._vertices or point != self._vertices[-1]:
             self._vertices.append(point)
             self.message.emit("Кликайте по вершинам; клик в первую вершину замыкает контур.")
+
+    def _release_zone(self, press: Point, point: Point) -> None:
+        self._rectangle = False
+        if press[0] == point[0] or press[1] == point[1]:
+            return
+        try:
+            self.editor.add_zone((*press, *point), self.zone_kind)
+        except ZoneError as error:
+            self.message.emit(str(error))
+            return
+        self.message.emit("")
+        self.edited.emit()
 
     def _apply_contour(self, vertices: list[Point]) -> None:
         try:
@@ -461,6 +503,8 @@ class ResultCard(QFrame):
         layout.setSpacing(10)
         layout.addLayout(header)
         layout.addLayout(rows)
+        # Карточка не сжимается: при нехватке высоты прокручивается вся правая колонка.
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
 
     def set_theme(self, theme: Theme) -> None:
         self._theme = theme
@@ -498,6 +542,8 @@ class ResultCard(QFrame):
             notes.append(f"углов без свай: {len(design.corners_without_piles)}")
         if design.bearing_issues:
             notes.append(f"опирание листов: {len(design.bearing_issues)} кромок")
+        if design.remarks:
+            notes.append("камера на ЦСП: промерзание и конденсат")
         v["Замечания"].setText(", ".join(notes) if notes else "нет")
         layout = design.sheet_layout
         if layout is not None:
@@ -511,6 +557,11 @@ class ResultCard(QFrame):
                 text += ", нужен лист толще"
             v["Лист ЦСП"].setText(text)
         self._refresh_status_style()
+        self._keep_height()
+
+    def _keep_height(self) -> None:
+        """Строки с переносом не сжимаются: прокрутка колонки не учитывает heightForWidth."""
+        self.setMinimumHeight(self.sizeHint().height())
 
     def clear(self) -> None:
         self._status = None
@@ -519,6 +570,7 @@ class ResultCard(QFrame):
         self._title.setStyleSheet("")
         for value in self._values.values():
             value.setText("—")
+        self._keep_height()
 
     def _refresh_status_style(self) -> None:
         if self._status is None:
@@ -568,6 +620,7 @@ class MainWindow(QMainWindow):
         )
         self.editor = PlanEditor(pile_step_mm=self.pile_step.value())
         self.plan = PlanView(self.editor)
+        self.zones_panel = ZonesPanel(self.editor)
         self.result_card = ResultCard()
         self.results = ResultsPanel()
         self.last_design: Design | None = None
@@ -637,7 +690,7 @@ class MainWindow(QMainWindow):
         board_form.addRow("Зазор", self.sheet_fields["gap"])
         load_form = self._form()
         load_form.addRow("Шаг свай", self.pile_step)
-        load_form.addRow("Временная нагрузка", self.live_load)
+        load_form.addRow("Временная вне зон", self.live_load)
 
         panel = QWidget()
         panel.setObjectName("panel")
@@ -648,6 +701,8 @@ class MainWindow(QMainWindow):
         side.addWidget(self.result_card)
         side.addWidget(_section("Сваи и нагрузка"))
         side.addLayout(load_form)
+        side.addWidget(_section("Зоны помещений"))
+        side.addWidget(self.zones_panel)
         side.addWidget(_section("Каркас"))
         side.addLayout(frame_form)
         side.addWidget(_section("Пол: ЦСП, ГОСТ 26816-2016"))
@@ -682,6 +737,10 @@ class MainWindow(QMainWindow):
         self._build_menu()
 
         self.plan.edited.connect(self._recalculate)
+        self.zones_panel.edited.connect(self._recalculate)
+        self.zones_panel.new_kind.currentIndexChanged.connect(
+            lambda _: setattr(self.plan, "zone_kind", self.zones_panel.new_kind.currentData())
+        )
         self.results.member_selected.connect(self.plan.select_member)
         self.plan.message.connect(self._message.setText)
         self.plan.cursor_moved.connect(self._show_cursor)
@@ -816,7 +875,7 @@ class MainWindow(QMainWindow):
             theme_menu.addAction(action)
 
     def set_tool(self, tool: str) -> None:
-        """Выбрать инструмент: «contour» или «piles»."""
+        """Выбрать инструмент: «contour», «piles» или «zones»."""
         self.plan.set_tool(tool)
         for action in self._tool_actions.actions():
             action.setChecked(action.data() == tool)
@@ -824,6 +883,7 @@ class MainWindow(QMainWindow):
             "contour": "Протяните прямоугольник или кликайте по вершинам контура.",
             "piles": "Клик — добавить сваю, перетащить — сдвинуть, "
             "правый клик или Delete — удалить.",
+            "zones": "Протяните прямоугольник зоны; назначение — в панели «Зоны помещений».",
         }
         self._message.setText(hints[tool])
 
@@ -909,6 +969,7 @@ class MainWindow(QMainWindow):
     def _recalculate(self) -> None:
         self.undo_action.setEnabled(self.editor.can_undo)
         self.redo_action.setEnabled(self.editor.can_redo)
+        self.zones_panel.refresh(self.editor.zones)
         board, sheets = self._board(), self._sheet_params()
         if board is None or sheets is None:
             return  # в исходных данных ошибка: последний результат остаётся на экране
@@ -931,6 +992,7 @@ class MainWindow(QMainWindow):
             perimeter_section=self.catalog.get(self.perimeter_profile.currentText()),
             internal_section=self.catalog.get(self.internal_profile.currentText()),
             jumper_section=self._jumper_section,
+            zones=self.editor.zones,
             steel=STEELS[self.steel.currentText()],
             electrode=self.electrode.currentText(),
             board=board,
@@ -1140,7 +1202,7 @@ class MainWindow(QMainWindow):
         if project is None:
             self.editor.load(None, ())
         else:
-            self.editor.load(project.outline, tuple(project.piles or ()))
+            self.editor.load(project.outline, tuple(project.piles or ()), project.zones)
         self.plan.select_member(None)
 
     def _recent(self) -> list[str]:
