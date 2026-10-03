@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from shapely.geometry import LineString
+from shapely.geometry import LineString, Polygon
 from shapely.ops import polygonize, unary_union
 
 from pile_frame.contour import Contour, Point
@@ -56,21 +56,33 @@ def _clip(points: list[tuple[float, float]], start: float, end: float) -> Profil
     return [(t0, t1, value(t0), value(t1)) for t0, t1 in zip(marks, marks[1:], strict=False)]
 
 
-def distribute_floor(contour: Contour, segments: list[tuple[Point, Point]]) -> dict[int, Profile]:
-    """Профили грузовой площади для каждой балки (по индексу в ``segments``)."""
+def floor_cells(contour: Contour, segments: list[tuple[Point, Point]]) -> list[Polygon]:
+    """Ячейки пола внутри контура, на которые его делят балки."""
     lines = [LineString(s) for s in segments] + [contour.polygon.boundary]
-    cells = [
+    return [
         cell
         for cell in polygonize(unary_union(lines))
         if contour.polygon.buffer(TOLERANCE_MM).contains(cell.representative_point())
     ]
+
+
+def is_rectangular(cell: Polygon) -> bool:
+    """Ячейка совпадает со своим габаритом (с допуском)."""
+    min_x, min_y, max_x, max_y = cell.bounds
+    width, height = max_x - min_x, max_y - min_y
+    return abs(cell.area - width * height) <= TOLERANCE_MM * (width + height)
+
+
+def distribute_floor(contour: Contour, segments: list[tuple[Point, Point]]) -> dict[int, Profile]:
+    """Профили грузовой площади для каждой балки (по индексу в ``segments``)."""
+    cells = floor_cells(contour, segments)
     ordered = [_ordered(s) for s in segments]
     loads: dict[int, Profile] = {i: [] for i in range(len(segments))}
 
     for cell in cells:
         min_x, min_y, max_x, max_y = cell.bounds
         width, height = max_x - min_x, max_y - min_y
-        rectangular = abs(cell.area - width * height) <= TOLERANCE_MM * (width + height)
+        rectangular = is_rectangular(cell)
         if rectangular:
             depth = min(width, height) / 2
             edges = [

@@ -22,14 +22,19 @@ def test_secondary_beams_are_added_only_under_joints_without_a_pile_line_beam():
     # Стык y = 1251,5 — балки нет: две промежуточные 0…3200 и 3200…6400.
     design = analyze(Project(contour=_rectangle(6400, 2500), pile_step_mm=3200, live_load_kpa=4.0))
 
-    under_y_joint = [m for m in design.members if m.start[1] == pytest.approx(1251.5) == m.end[1]]
+    # Перемычки в ячейках дробят балку под стыком на части, но не меняют её пролёты.
+    beams = [m for m in design.members if m.kind == "beam"]
+    under_y_joint = [m for m in beams if m.start[1] == pytest.approx(1251.5) == m.end[1]]
     near_x_joint = [
         m
-        for m in design.members
+        for m in beams
         if abs(m.start[0] - 3201.5) < 30 and m.start[0] == m.end[0] and m.start[0] != 3200
     ]
 
-    assert sorted(m.length_mm for m in under_y_joint) == pytest.approx([3200, 3200])
+    assert sum(m.length_mm for m in under_y_joint) == pytest.approx(6400)
+    assert not any(
+        min(m.start[0], m.end[0]) < 3200 < max(m.start[0], m.end[0]) for m in under_y_joint
+    )
     assert near_x_joint == []
 
 
@@ -121,11 +126,11 @@ def test_thin_walled_internal_beams_fail_by_web_stability_not_by_strength():
 
 def test_welds_are_checked_where_joint_beams_meet_other_beams():
     # 6400 × 2500, сваи через 3200: балка под стыком y = 1251,5 примыкает к периметру x = 0 и
-    # x = 6400 и к балке по сваям x = 3200 → три узла со швами.
+    # x = 6400 и к балке по сваям x = 3200 → три узла со швами (остальные — концы перемычек).
     design = analyze(Project(contour=_rectangle(6400, 2500), pile_step_mm=3200, live_load_kpa=4.0))
 
     points = sorted((round(w.point[0]), round(w.point[1])) for w in design.welds)
-    assert points == [(0, 1252), (3200, 1252), (6400, 1252)]
+    assert [p for p in points if p[0] in (0, 3200, 6400)] == [(0, 1252), (3200, 1252), (6400, 1252)]
     assert all(0 < w.check.utilization < 1 for w in design.welds)
     assert design.electrode_issue is None
 

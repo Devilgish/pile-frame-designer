@@ -15,10 +15,12 @@ from pile_frame.analysis import (
     analyze_frame,
     gamma_f_live,
 )
+from pile_frame.board_check import BoardCheck, check_board, jumpers_needed
 from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour, Point
+from pile_frame.floor_load import floor_cells, is_rectangular
 from pile_frame.materials import C245, Steel
-from pile_frame.sections import Section, TUBE_120x60x4, TUBE_120x120x5
+from pile_frame.sections import Section, TUBE_40x40x3, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.sheets import LongSide, SheetLayout, layout_sheets
 from pile_frame.welds import DEFAULT_ELECTRODE, electrode_issue
 
@@ -41,12 +43,15 @@ class Project:
     piles: tuple[Point, ...] | None = None
     perimeter_section: Section = TUBE_120x120x5
     internal_section: Section = TUBE_120x60x4
+    #: Перемычки внутри ячеек там, где лист ЦСП не проходит между балками.
+    jumper_section: Section = TUBE_40x40x3
     steel: Steel = C245
     board: BoardSpec = field(default_factory=BoardSpec)
     sheet_long_side: LongSide = "x"
     sheet_offset_mm: tuple[float, float] = (0.0, 0.0)
     sheet_gap_mm: float = 3.0
-    #: Ставить балки под стыками листов. Выключается, чтобы рассмотреть каркас только по сваям.
+    #: Ставить балки под стыками листов и перемычки, проверять лист. Выключается, чтобы
+    #: рассмотреть каркас только по сваям.
     sheet_joints: bool = True
     #: Электрод для ручной сварки примыканий (таблица Г.2).
     electrode: str = DEFAULT_ELECTRODE
@@ -74,10 +79,24 @@ class Member:
     start: tuple[float, float]
     end: tuple[float, float]
     section: Section
+    #: «perimeter», «beam» (по сваям и под стыками) или «jumper» (перемычка в ячейке).
+    kind: str = "beam"
 
     @property
     def length_mm(self) -> float:
         return math.dist(self.start, self.end)
+
+
+@dataclass(frozen=True)
+class BoardCell:
+    """Ячейка между балками: перемычки в ней и проверка листа на итоговом пролёте.
+
+    ``jumpers`` равно ``None``, если лист не проходит даже с перемычками.
+    """
+
+    bounds: tuple[float, float, float, float]
+    jumpers: int | None
+    check: BoardCheck
 
 
 @dataclass(frozen=True)
@@ -96,6 +115,7 @@ class Design:
     corners_without_piles: list[Point] = field(default_factory=list)
     unsupported_members: list[Member] = field(default_factory=list)
     sheet_layout: SheetLayout | None = None
+    board_cells: list[BoardCell] = field(default_factory=list)
 
     def failing_members(self) -> list[Member]:
         """Элементы, не прошедшие проверку, и балки без опоры на одном из концов."""
@@ -229,33 +249,68 @@ def _joint_members(
     return segments
 
 
+def _jumpers(
+    contour: Contour, segments: list[tuple[Point, Point]], project: Project
+) -> tuple[list[tuple[Point, Point]], list[BoardCell]]:
+    """Перемычки в ячейках, где лист не проходит, и проверка листа в каждой ячейке.
+
+    Перемычки перекрывают короткую сторону ячейки и ставятся с равным шагом вдоль длинной.
+    """
+    jumpers: list[tuple[Point, Point]] = []
+    cells = []
+    for cell in floor_cells(contour, segments):
+        min_x, min_y, max_x, max_y = cell.bounds
+        width, height = max_x - min_x, max_y - min_y
+        short, long = sorted((width, height))
+        count = jumpers_needed(
+            project.board, short_mm=short, long_mm=long, live_load_kpa=project.live_load_kpa
+        )
+        pitch = long / ((count or 0) + 1)
+        for k in range(1, (count or 0) + 1):
+            if width >= height:
+                line = LineString([(min_x + pitch * k, min_y), (min_x + pitch * k, max_y)])
+            else:
+                line = LineString([(min_x, min_y + pitch * k), (max_x, min_y + pitch * k)])
+            part = line if is_rectangular(cell) else cell.intersection(line)
+            jumpers += [(g.coords[0], g.coords[-1]) for g in _parts(part)]
+        check = check_board(
+            project.board, span_mm=min(short, pitch), live_load_kpa=project.live_load_kpa
+        )
+        cells.append(BoardCell(cell.bounds, count, check))
+    return jumpers, cells
+
+
 def _members(
     contour: Contour,
     piles: list[Point],
-    perimeter_section: Section,
-    internal_section: Section,
+    project: Project,
     layout: SheetLayout | None = None,
-) -> list[Member]:
-    """Балки каркаса в одной плоскости: периметр, балки по сваям и под стыками листов."""
+) -> tuple[list[Member], list[BoardCell]]:
+    """Балки каркаса в одной плоскости: периметр, по сваям, под стыками листов, перемычки."""
     perimeter = _perimeter_members(contour, piles)
     internal = _internal_members(contour, piles)
+    jumpers: list[tuple[Point, Point]] = []
+    cells: list[BoardCell] = []
     if layout is not None:
         internal += _joint_members(
             contour,
             (layout.joints_x, layout.joints_y),
             perimeter + internal,
-            internal_section.width_mm / 2,
+            project.internal_section.width_mm / 2,
         )
-    typed = [(seg, perimeter_section) for seg in perimeter]
-    typed += [(seg, internal_section) for seg in internal]
-    return [Member(a, b, section) for (a, b), section in _split_at_nodes(typed)]
+        jumpers, cells = _jumpers(contour, perimeter + internal, project)
+    typed = [(seg, project.perimeter_section, "perimeter") for seg in perimeter]
+    typed += [(seg, project.internal_section, "beam") for seg in internal]
+    typed += [(seg, project.jumper_section, "jumper") for seg in jumpers]
+    members = [Member(a, b, section, kind) for (a, b), section, kind in _split_at_nodes(typed)]
+    return members, cells
 
 
-def _split_at_nodes(typed: list[tuple[tuple[Point, Point], Section]]):
+def _split_at_nodes(typed: list[tuple[tuple[Point, Point], Section, str]]):
     """Разрезать балки в узлах, где к ним примыкают другие балки (Т-образные примыкания)."""
-    ends = {p for (a, b), _ in typed for p in (a, b)}
+    ends = {p for (a, b), _, _ in typed for p in (a, b)}
     result = []
-    for (a, b), section in typed:
+    for (a, b), section, kind in typed:
         inner = [
             p
             for p in ends
@@ -264,7 +319,7 @@ def _split_at_nodes(typed: list[tuple[tuple[Point, Point], Section]]):
             and LINE_TOLERANCE_MM < math.dist(a, p) < math.dist(a, b) - LINE_TOLERANCE_MM
         ]
         points = [a, *sorted(inner, key=lambda p: math.dist(a, p)), b]
-        result += [((p, q), section) for p, q in zip(points, points[1:], strict=False)]
+        result += [((p, q), section, kind) for p, q in zip(points, points[1:], strict=False)]
     return result
 
 
@@ -284,12 +339,8 @@ def analyze(project: Project) -> Design:
         offset_mm=project.sheet_offset_mm,
         gap_mm=project.sheet_gap_mm,
     )
-    members = _members(
-        contour,
-        supports,
-        project.perimeter_section,
-        project.internal_section,
-        layout if project.sheet_joints else None,
+    members, board_cells = _members(
+        contour, supports, project, layout if project.sheet_joints else None
     )
     corners = [
         v
@@ -314,4 +365,5 @@ def analyze(project: Project) -> Design:
         corners_without_piles=corners,
         unsupported_members=unsupported,
         sheet_layout=layout,
+        board_cells=board_cells,
     )

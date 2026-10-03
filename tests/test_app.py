@@ -103,14 +103,22 @@ def _window_with_rectangle(qtbot):
     return window
 
 
+def _worst_beam(design) -> float:
+    """Наибольшая загрузка балок по сваям и под стыками (без периметра и перемычек)."""
+    return max(
+        c.strength_utilization
+        for m, c in zip(design.members, design.checks, strict=True)
+        if m.kind == "beam"
+    )
+
+
 def test_choosing_heavier_internal_profile_recalculates_result(qtbot):
     window = _window_with_rectangle(qtbot)
-    before = int(window.result_card.value("Прочность").rstrip("%"))
+    before = _worst_beam(window.last_design)
 
     window.internal_profile.setCurrentText("120×120×5")
 
-    after = int(window.result_card.value("Прочность").rstrip("%"))
-    assert after < before
+    assert _worst_beam(window.last_design) < before
 
 
 def test_zero_board_thickness_shows_error_next_to_field_and_keeps_last_result(qtbot):
