@@ -1,0 +1,86 @@
+{
+  "app": "pile-frame-designer",
+  "format_version": 1,
+  "object_name": "Кондитерский цех",
+  "plan": {
+    "contour": [
+      [0.0, 0.0],
+      [6000.0, 0.0],
+      [6000.0, 2000.0],
+      [3000.0, 2000.0],
+      [3000.0, 4000.0],
+      [0.0, 4000.0]
+    ],
+    "piles": [
+      [0.0, 0.0],
+      [1750.0, 0.0],
+      [3000.0, 0.0],
+      [4500.0, 0.0],
+      [6000.0, 0.0],
+      [0.0, 2000.0],
+      [1500.0, 2000.0],
+      [3000.0, 2000.0],
+      [4500.0, 2000.0],
+      [6000.0, 2000.0],
+      [0.0, 4000.0],
+      [1500.0, 4000.0],
+      [3000.0, 4000.0]
+    ],
+    "pile_step_mm": 2000
+  },
+  "loads": {
+    "live_load_kpa": 2.5
+  },
+  "frame": {
+    "perimeter": {
+      "name": "120×60×4",
+      "height_mm": 120,
+      "width_mm": 60,
+      "thickness_mm": 4,
+      "mass_kg_m": 10.48,
+      "area_cm2": 13.35,
+      "ix_cm4": 240.7,
+      "wx_cm3": 40.12
+    },
+    "internal": {
+      "name": "120×60×4",
+      "height_mm": 120,
+      "width_mm": 60,
+      "thickness_mm": 4,
+      "mass_kg_m": 10.48,
+      "area_cm2": 13.35,
+      "ix_cm4": 240.7,
+      "wx_cm3": 40.12
+    },
+    "jumper": {
+      "name": "40×40×3",
+      "height_mm": 40,
+      "width_mm": 40,
+      "thickness_mm": 3,
+      "mass_kg_m": 3.3,
+      "area_cm2": 4.21,
+      "ix_cm4": 9.31,
+      "wx_cm3": 4.65
+    },
+    "steel": "С255",
+    "electrode": "Э50"
+  },
+  "board": {
+    "length_mm": 3600,
+    "width_mm": 1200,
+    "thickness_mm": 28,
+    "density_kg_m3": 1250
+  },
+  "sheets": {
+    "long_side": "y",
+    "offset_mm": [300.0, 150.0],
+    "gap_mm": 4.0,
+    "joints": true
+  },
+  "summary": {
+    "status": "Проходит, есть замечания",
+    "max_utilization": 0.812,
+    "members": 72,
+    "total_reaction_kn": 67.193
+  }
+}
