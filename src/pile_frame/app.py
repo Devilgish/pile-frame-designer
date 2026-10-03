@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QGraphicsScene,
@@ -48,8 +49,10 @@ from pile_frame.editor import PlanEditor
 from pile_frame.inputs import NumberField, ProfilesDialog
 from pile_frame.issues import Issue, errors
 from pile_frame.materials import C245, STEELS
+from pile_frame.pdf import write_pdf
 from pile_frame.qt_theme import THEME_MODES, apply_theme, resolve_theme, status_icon
 from pile_frame.report import Report, ReportMeta, build_report
+from pile_frame.report_dialog import ReportDialog
 from pile_frame.results import ResultsPanel
 from pile_frame.sections import ProfileCatalog, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.status import Status, design_status
@@ -730,6 +733,11 @@ class MainWindow(QMainWindow):
         self.redo_action.setShortcuts([QKeySequence("Ctrl+Y"), QKeySequence("Ctrl+Shift+Z")])
         self.undo_action.triggered.connect(self._undo)
         self.redo_action.triggered.connect(self._redo)
+        self.report_action = QAction(
+            "Расчётная записка PDF…", self, shortcut=QKeySequence.StandardKey.Print
+        )
+        self.report_action.setEnabled(False)
+        self.report_action.triggered.connect(self._export_report)
         toolbar.addAction(self.undo_action)
         toolbar.addAction(self.redo_action)
         toolbar.addSeparator()
@@ -754,6 +762,8 @@ class MainWindow(QMainWindow):
         edit.addAction(self.redo_action)
         data = self.menuBar().addMenu("Данные")
         data.addAction("Профили…", self._open_profiles)
+        data.addSeparator()
+        data.addAction(self.report_action)
         view = self.menuBar().addMenu("Вид")
         theme_menu = view.addMenu("Тема")
         self._theme_actions = QActionGroup(self)
@@ -867,6 +877,7 @@ class MainWindow(QMainWindow):
             self.results.show_design(None)
             self.last_design = None
             self.last_project = None
+            self.report_action.setEnabled(False)
             self.result_card.clear()
             return
         project = Project(
@@ -885,6 +896,7 @@ class MainWindow(QMainWindow):
         )
         design = analyze(project)
         self.last_project, self.last_design = project, design
+        self.report_action.setEnabled(True)
         theme = resolve_theme(self._theme_mode)
         if design.electrode_issue:
             self.electrode_issue.setText("Внимание: " + design.electrode_issue)
@@ -895,6 +907,27 @@ class MainWindow(QMainWindow):
         self.plan.show_design(design)
         self.results.show_design(design)
         self.result_card.show_design(contour, design)
+
+    def _export_report(self) -> None:
+        """Спросить титул и файл, сверстать записку по текущему результату."""
+        if self.last_design is None:
+            return
+        meta = ReportDialog.ask(self, _settings())
+        if meta is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить расчётную записку",
+            f"Расчётная записка — {meta.object_name}.pdf",
+            "PDF (*.pdf)",
+        )
+        if not path:
+            return
+        write_pdf(self.build_report(meta), path)
+        self._message.setText(f"Записка сохранена: {path}")
+
+    def status_message(self) -> str:
+        return self._message.text()
 
     def build_report(self, meta: ReportMeta) -> Report:
         """Расчётная записка по текущему результату."""

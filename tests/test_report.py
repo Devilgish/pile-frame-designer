@@ -4,8 +4,9 @@ import datetime
 
 import pytest
 
+from pile_frame import assumptions
 from pile_frame.design import Project, analyze
-from pile_frame.report import ReportMeta, build_report
+from pile_frame.report import Heading, PlanFigure, ReportMeta, build_report
 
 META = ReportMeta(object_name="Цех", author="Исполнитель", date=datetime.date(2026, 10, 3))
 
@@ -126,7 +127,8 @@ def test_light_live_load_gets_the_higher_factor_in_the_loads_table():
 
 
 def _wide_cells_report():
-    # 6400 × 2500, сваи через 3200, лист 24 мм: по 4 перемычки, пролёт листа 640 (test_design_jumpers).
+    # 6400 × 2500, сваи через 3200, лист 24 мм: по 4 перемычки, пролёт листа 640
+    # (см. test_design_jumpers).
     project = Project(width_mm=6400, length_mm=2500, pile_step_mm=3200, live_load_kpa=4.0)
     return build_report(project, analyze(project), META)
 
@@ -160,3 +162,62 @@ def test_governing_weld_is_written_out_with_formula_176():
     assert "N / (βf·kf·lw·Rwf·γc) = 21,62·10³ / (0,7 · 4 · 220 · 200 · 1) = 0,176 ≤ 1" in (
         formula.lines
     )
+
+
+def test_report_has_all_sections_and_ends_with_what_is_not_checked():
+    report = _wide_cells_report()
+
+    assert [s.title for s in report.sections] == [
+        "Итог",
+        "Исходные данные",
+        "Нагрузки",
+        "Расчётная схема",
+        "Проверки элементов каркаса",
+        "Лист ЦСП и перемычки",
+        "Сварные швы",
+        "Реакции свай",
+        "Что не проверяется и принятые упрощения",
+    ]
+    last = "\n".join(b.text for b in report.sections[-1].blocks if hasattr(b, "text"))
+    for item in assumptions.NOT_CHECKED:
+        assert item in last
+    assert assumptions.DISCLAIMER in last
+
+
+def test_plan_figure_labels_members_and_piles_like_the_tables():
+    report = _wide_cells_report()
+    figure = next(b for s in report.sections for b in s.blocks if isinstance(b, PlanFigure))
+    members = _table(report, "Элементы каркаса").rows
+    piles = _table(report, "Реакции свай").rows
+
+    assert [m.label for m in figure.members] == [row[0] for row in members]
+    assert [label for _, label in figure.piles] == [row[0] for row in piles]
+    assert any(m.kind == "jumper" for m in figure.members)
+
+
+def test_sheet_edges_without_screw_room_are_listed():
+    # Лист 24 мм на 120×60: 8 кромок с опорой 19–22 мм при нужных 25 (test_design_bearing).
+    report = _wide_cells_report()
+    rows = _table(report, "Кромки листов без места под саморез").rows
+
+    assert len(rows) == 8
+    assert {row[-1] for row in rows} == {"25"}
+    assert {row[-2] for row in rows} == {"19,0", "20,5", "22,0"}
+
+
+def test_each_governing_element_gets_a_heading_with_its_mark_and_length():
+    # Квадрат: четыре одинаковые стороны периметра 2000 мм, самая загруженная — первая (Б1).
+    headings = [
+        b.text for s in _square_report().sections for b in s.blocks if isinstance(b, Heading)
+    ]
+
+    assert "Балка периметра Б1: 120×120×5, длина 2000 мм" in headings
+
+
+def test_summary_repeats_the_electrode_remark():
+    # Э42 для С245 не выполняет п. 14.1.8 (см. test_welds).
+    project = Project(
+        width_mm=6400, length_mm=2500, pile_step_mm=3200, live_load_kpa=4.0, electrode="Э42"
+    )
+
+    assert "14.1.8" in build_report(project, analyze(project), META).summary()

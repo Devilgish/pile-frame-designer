@@ -2,13 +2,15 @@
 
 import datetime
 
-from PySide6.QtCore import QPointF, Qt
+from pypdf import PdfReader
+from PySide6.QtCore import QPointF, QSettings, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from pile_frame.app import MainWindow
 from pile_frame.report import ReportMeta
+from pile_frame.report_dialog import ReportDialog
 from pile_frame.status import Status
 from pile_frame.theme import DARK
 
@@ -246,3 +248,39 @@ def test_report_repeats_the_numbers_shown_in_the_window(qtbot):
     ):
         assert sorted(tables[title].rows) == _rows(view), title
     assert window.result_card.status_text() in report.summary()
+
+
+def test_report_is_exported_to_pdf_from_the_menu(qtbot, tmp_path, monkeypatch):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    assert not window.report_action.isEnabled()  # нечего выводить, пока нет контура
+
+    _drag(window.plan, (0, 0), (6000, 4000))
+    meta = ReportMeta(
+        object_name="Кондитерский цех", author="Петров П. П.", date=datetime.date(2026, 10, 3)
+    )
+    target = tmp_path / "записка.pdf"
+    monkeypatch.setattr("pile_frame.app.ReportDialog.ask", lambda *args: meta)
+    monkeypatch.setattr(
+        "pile_frame.app.QFileDialog.getSaveFileName", lambda *args, **kwargs: (str(target), "")
+    )
+    window.report_action.trigger()
+
+    first_page = PdfReader(target).pages[0].extract_text()
+    assert "Кондитерский цех" in first_page
+    assert str(target) in window.status_message()
+
+
+def test_report_dialog_fills_the_title_and_falls_back_to_defaults(qtbot, tmp_path):
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    dialog = ReportDialog(None, settings)
+    qtbot.addWidget(dialog)
+
+    dialog.object_name.clear()
+    dialog.author.setText("Сидоров С. С.")
+    meta = dialog.meta()
+
+    assert meta.object_name == "Заготовочное производство"
+    assert meta.author == "Сидоров С. С."
+    assert meta.date == datetime.date.today()

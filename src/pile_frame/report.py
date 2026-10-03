@@ -12,7 +12,7 @@ import math
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 
-from pile_frame import tables
+from pile_frame import assumptions, tables
 from pile_frame.analysis import (
     GAMMA_F_BOARD,
     GAMMA_F_POINT,
@@ -79,6 +79,13 @@ class Paragraph:
 
 
 @dataclass(frozen=True)
+class Heading:
+    """Подзаголовок внутри раздела."""
+
+    text: str
+
+
+@dataclass(frozen=True)
 class Formula:
     """Проверка: название с пунктом норм, строки расчёта, итоговый коэффициент использования."""
 
@@ -92,6 +99,25 @@ class Table:
     title: str
     headers: tuple[str, ...]
     rows: list[tuple[str, ...]]
+
+
+@dataclass(frozen=True)
+class PlanMember:
+    start: tuple[float, float]
+    end: tuple[float, float]
+    kind: str
+    label: str
+    failing: bool
+
+
+@dataclass(frozen=True)
+class PlanFigure:
+    """Схема плана: контур, элементы с марками, сваи с марками, кромки без опоры."""
+
+    contour: tuple[tuple[float, float], ...]
+    members: tuple[PlanMember, ...]
+    piles: tuple[tuple[tuple[float, float], str], ...]
+    bearing: tuple[tuple[tuple[float, float], tuple[float, float]], ...]
 
 
 @dataclass
@@ -220,13 +246,20 @@ def _flange(member: Member, check, project: Project) -> Formula:
 def _members_section(project: Project, design: Design) -> Section:
     section = Section("Проверки элементов каркаса")
     for kind, title in KIND_TITLES.items():
-        pairs = [
-            (m, c) for m, c in zip(design.members, design.checks, strict=True) if m.kind == kind
+        indexed = [
+            (i, m, c)
+            for i, (m, c) in enumerate(zip(design.members, design.checks, strict=True))
+            if m.kind == kind
         ]
-        if not pairs:
+        if not indexed:
             continue
-        member, check = max(pairs, key=lambda mc: mc[1].utilization)
-        section.blocks.append(Paragraph(f"{title}: {member.section.name}"))
+        index, member, check = max(indexed, key=lambda imc: imc[2].utilization)
+        section.blocks.append(
+            Heading(
+                f"{title} {tables.member_label(index)}: {member.section.name}, "
+                f"длина {member.length_mm:.0f} мм"
+            )
+        )
         section.blocks.append(_bending(member, check, project))
         section.blocks.append(_shear(member, check, project))
         section.blocks.append(_deflection(check))
@@ -333,6 +366,25 @@ def _boards_section(project: Project, design: Design) -> Section | None:
     section.blocks += _board_formulas(project, cell.check)
     rows = [_texts(tables.board_row(c)) for c in design.board_cells]
     section.blocks.append(Table("Ячейки листов ЦСП", tables.BOARD_COLUMNS, rows))
+    if design.bearing_issues:
+        section.blocks.append(
+            Paragraph(
+                "Кромка листа должна лежать на плоской части полки (без скруглений R = 2t, "
+                "ГОСТ 30245-2003) не меньше, чем отступ самореза от кромки по рекомендациям "
+                "производителя. Недостаток не исправляется автоматически."
+            )
+        )
+        rows = [
+            (
+                f"({i.start[0]:.0f}; {i.start[1]:.0f}) — ({i.end[0]:.0f}; {i.end[1]:.0f})",
+                f"{math.dist(i.start, i.end):.0f}",
+                tables.fmt(i.bearing_mm),
+                short(i.required_mm),
+            )
+            for i in design.bearing_issues
+        ]
+        headers = ("Кромка, мм", "Длина, мм", "Опора, мм", "Нужно, мм")
+        section.blocks.append(Table("Кромки листов без места под саморез", headers, rows))
     return section
 
 
@@ -443,6 +495,78 @@ def _reactions_section(design: Design) -> Section:
     )
 
 
+_LONG_SIDE = {"x": "длинной стороной вдоль X", "y": "длинной стороной вдоль Y"}
+
+
+def _input_section(project: Project, design: Design) -> Section:
+    contour = project.outline
+    xs = [x for x, _ in contour.vertices]
+    ys = [y for _, y in contour.vertices]
+    board = project.board
+    jumper = next((m.section.name for m in design.members if m.kind == "jumper"), "не нужны")
+    offset = project.sheet_offset_mm
+    rows = [
+        ("Габариты плана", f"{max(xs) - min(xs):.0f} × {max(ys) - min(ys):.0f} мм"),
+        ("Площадь", f"{tables.fmt(contour.area_mm2 / 1e6)} м²"),
+        ("Вершин контура", str(len(contour.vertices))),
+        ("Свай", str(len(design.piles))),
+        ("Профиль периметра", f"{project.perimeter_section.name}, ГОСТ 30245-2003"),
+        ("Внутренние балки", f"{project.internal_section.name}, ГОСТ 30245-2003"),
+        ("Перемычки", jumper),
+        ("Сталь", f"{project.steel.name}, Ry по СП 16.13330.2017, таблица В.3"),
+        ("Электрод", f"{project.electrode}, ручная сварка"),
+        (
+            "Лист ЦСП",
+            f"{short(board.length_mm)} × {short(board.width_mm)} × {short(board.thickness_mm)} мм, "
+            f"{short(board.density_kg_m3)} кг/м³, ГОСТ 26816-2016",
+        ),
+        (
+            "Раскладка листов",
+            f"{_LONG_SIDE[project.sheet_long_side]}, смещение {short(offset[0])}; "
+            f"{short(offset[1])} мм, зазор {short(project.sheet_gap_mm)} мм",
+        ),
+        ("Временная нагрузка", f"{num(project.live_load_kpa, 2)} кПа"),
+    ]
+    return Section("Исходные данные", [Table("Исходные данные", ("Параметр", "Значение"), rows)])
+
+
+def plan_figure(design: Design, contour) -> PlanFigure:
+    failing = {id(m) for m in design.failing_members()}
+    members = tuple(
+        PlanMember(m.start, m.end, m.kind, tables.member_label(i), id(m) in failing)
+        for i, m in enumerate(design.members)
+    )
+    piles = tuple((p, tables.pile_label(i)) for i, p in enumerate(design.reactions_kn))
+    bearing = tuple((i.start, i.end) for i in design.bearing_issues)
+    return PlanFigure(tuple(contour.vertices), members, piles, bearing)
+
+
+def _scheme_section(project: Project, design: Design) -> Section:
+    return Section(
+        "Расчётная схема",
+        [
+            Paragraph(assumptions.SIMPLIFICATIONS[0]),
+            Paragraph(assumptions.SIMPLIFICATIONS[1]),
+            Paragraph(assumptions.SIMPLIFICATIONS[2]),
+            plan_figure(design, project.outline),
+            Paragraph(
+                "Марки элементов (Б…) и свай (С…) совпадают с таблицами записки и программы. "
+                "Перемычки показаны тонкими линиями, непроходящие элементы — пунктиром, "
+                "кромки листов без опоры под саморез — штрихом."
+            ),
+        ],
+    )
+
+
+def _limitations_section() -> Section:
+    blocks: list = [Heading("Не проверяется")]
+    blocks += [Paragraph(f"• {item}") for item in assumptions.NOT_CHECKED]
+    blocks.append(Heading("Принятые упрощения"))
+    blocks += [Paragraph(f"• {item}") for item in assumptions.SIMPLIFICATIONS]
+    blocks.append(Paragraph(assumptions.DISCLAIMER))
+    return Section("Что не проверяется и принятые упрощения", blocks)
+
+
 def _summary_section(design: Design) -> Section:
     status, label, utilization = design_status(design)
     member = design.governing_member
@@ -467,10 +591,13 @@ def _summary_section(design: Design) -> Section:
 def build_report(project: Project, design: Design, meta: ReportMeta) -> Report:
     sections = [
         _summary_section(design),
+        _input_section(project, design),
         _loads_section(project, design),
+        _scheme_section(project, design),
         _members_section(project, design),
         _boards_section(project, design),
         _welds_section(design),
         _reactions_section(design),
+        _limitations_section(),
     ]
     return Report(meta, [s for s in sections if s is not None])
