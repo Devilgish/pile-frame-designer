@@ -22,12 +22,22 @@ from pile_frame.sections import ProfileCatalog, Section
 from pile_frame.status import design_status
 from pile_frame.tables import fmt
 from pile_frame.welds import ELECTRODES
+from pile_frame.zones import PRESETS, Zone, ZoneError, place_zone
 
 APP_ID = "pile-frame-designer"
-FORMAT_VERSION = 1
+#: 1 — исходный формат; 2 — добавлены зоны помещений.
+FORMAT_VERSION = 2
 EXTENSION = ".karkas"
+
+
 #: Обновление данных файла с версии N до N + 1. Старые файлы проходят цепочку до текущей.
-MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {}
+def _v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
+    """В формате 1 зон не было: проект без зон."""
+    data["zones"] = []
+    return data
+
+
+MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {1: _v1_to_v2}
 
 
 class ProjectFileError(ValueError):
@@ -84,6 +94,10 @@ def summary_note(saved: dict[str, Any] | None, design: Design) -> str | None:
     )
 
 
+def _one_line(match: re.Match[str]) -> str:
+    return "[" + ", ".join(v.strip() for v in match.group(1).split(",")) + "]"
+
+
 def save_text(project: Project, object_name: str, design: Design | None = None) -> str:
     """Проект в текст файла."""
     board = project.board
@@ -111,11 +125,20 @@ def save_text(project: Project, object_name: str, design: Design | None = None) 
             "gap_mm": project.sheet_gap_mm,
             "joints": project.sheet_joints,
         },
+        "zones": [
+            {
+                "kind": z.kind,
+                "rect": list(z.rect),
+                "live_load_kpa": z.live_load_kpa,
+                "cold_on_board": z.cold_on_board,
+            }
+            for z in project.zones
+        ],
         "summary": None if design is None else summarize(design),
     }
     text = json.dumps(data, ensure_ascii=False, indent=2)
-    # Пары координат — в одну строку: [1250.0, 0.0].
-    return re.sub(r"\[\s*(-?[\d.e+-]+),\s*(-?[\d.e+-]+)\s*\]", r"[\1, \2]", text)
+    # Числовые массивы (координаты, прямоугольники зон) — в одну строку: [1250.0, 0.0].
+    return re.sub(r"\[\s*(-?[\d.e+-]+(?:,\s*-?[\d.e+-]+)*)\s*\]", _one_line, text)
 
 
 def _points(raw) -> tuple[tuple[float, float], ...]:
@@ -202,6 +225,7 @@ def load_text(text: str, catalog: ProfileCatalog) -> LoadedProject:
         board_errors = errors(validate_board(board))
         if board_errors:
             raise ProjectFileError("В файле неверный лист: " + board_errors[0].message)
+        zones = _zones(data["zones"], contour)
         notes: list[str] = []
         sections = {
             key: _profile(frame[key], catalog, notes) for key in ("perimeter", "internal", "jumper")
@@ -221,12 +245,31 @@ def load_text(text: str, catalog: ProfileCatalog) -> LoadedProject:
             sheet_offset_mm=tuple(float(v) for v in sheets["offset_mm"]),
             sheet_gap_mm=gap,
             sheet_joints=bool(sheets["joints"]),
+            zones=zones,
         )
         return LoadedProject(project, str(data["object_name"]), data["summary"], notes)
     except ProjectFileError:
         raise
     except (KeyError, TypeError, ValueError, AttributeError) as error:
         raise ProjectFileError(f"Файл проекта повреждён: {_describe(error)}.") from error
+
+
+def _zones(raw: list[dict[str, Any]], contour: Contour) -> tuple[Zone, ...]:
+    """Зоны из файла с теми же проверками, что при рисовании: внутри контура, без наложений."""
+    zones: list[Zone] = []
+    for item in raw:
+        kind = item["kind"]
+        if kind not in PRESETS:
+            raise ProjectFileError(f"В файле неизвестное назначение зоны «{kind}».")
+        load = float(item["live_load_kpa"])
+        if load < 0:
+            raise ValueError("отрицательная нагрузка зоны")
+        try:
+            placed = place_zone(contour, zones, tuple(float(v) for v in item["rect"]), kind)
+        except ZoneError as error:
+            raise ProjectFileError(f"В файле неверная зона: {error}") from error
+        zones.append(Zone(kind, placed.rect, load, bool(item.get("cold_on_board", False))))
+    return tuple(zones)
 
 
 def _describe(error: Exception) -> str:

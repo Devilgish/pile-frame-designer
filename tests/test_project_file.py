@@ -9,8 +9,15 @@ from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour
 from pile_frame.design import Project, analyze, auto_piles
 from pile_frame.materials import STEELS
-from pile_frame.project_file import ProjectFileError, load_text, save_text, summary_note
+from pile_frame.project_file import (
+    FORMAT_VERSION,
+    ProjectFileError,
+    load_text,
+    save_text,
+    summary_note,
+)
 from pile_frame.sections import ProfileCatalog, Section, TUBE_120x60x4
+from pile_frame.zones import Zone
 
 L_SHAPE = Contour.from_points(
     [(0, 0), (6000, 0), (6000, 2000), (3000, 2000), (3000, 4000), (0, 4000)]
@@ -76,7 +83,7 @@ DELETE = object()
         ("это не JSON", "не является файлом проекта"),
         ('{"name": "чужой файл"}', "не является файлом проекта"),
         ("[1, 2, 3]", "не является файлом проекта"),
-        (lambda: _saved(format_version=2), "создан более новой версией программы"),
+        (lambda: _saved(format_version=FORMAT_VERSION + 1), "создан более новой версией"),
         (lambda: _saved(board=DELETE), "повреждён"),
         (lambda: _saved(plan__piles="abc"), "повреждён"),
         (lambda: _saved(frame__steel="С999"), "сталь «С999»"),
@@ -127,9 +134,11 @@ def test_project_saved_by_format_version_1_still_opens():
 
 
 def test_old_format_is_upgraded_step_by_step(monkeypatch):
-    # Формат 1 → 2: нагрузка переименована; 2 → 3: нагрузка задаётся в Па.
+    # Условная цепочка: 1 → 2 переименовывает нагрузку и добавляет зоны, 2 → 3 возвращает имя
+    # и удваивает значение — по результату видно, что обе миграции прошли по порядку.
     def to_2(data):
         data["loads"] = {"live_kpa": data["loads"]["live_load_kpa"]}
+        data["zones"] = []
         return data
 
     def to_3(data):
@@ -137,7 +146,10 @@ def test_old_format_is_upgraded_step_by_step(monkeypatch):
         data["loads"]["live_load_kpa"] *= 2  # условная правка, видимая в результате
         return data
 
-    text = save_text(_project(live_load_kpa=1.5), "Цех")
+    data = json.loads(save_text(_project(live_load_kpa=1.5), "Цех"))
+    data["format_version"] = 1
+    del data["zones"]
+    text = json.dumps(data, ensure_ascii=False)
     monkeypatch.setattr("pile_frame.project_file.FORMAT_VERSION", 3)
     monkeypatch.setattr("pile_frame.project_file.MIGRATIONS", {1: to_2, 2: to_3})
 
@@ -223,3 +235,58 @@ def test_frame_on_piles_only_mode_is_kept():
     project = _project(sheet_joints=False)
 
     assert load_text(save_text(project, "Цех"), ProfileCatalog()).project == project
+
+
+ZONES = (
+    Zone("pastry", (0.0, 0.0, 3000.0, 2000.0), 2.0),
+    Zone("cold", (3000.0, 0.0, 6000.0, 2000.0), 6.5, cold_on_board=True),  # нагрузка изменена
+)
+
+
+def test_zones_are_saved_with_edited_loads_and_cold_room_option():
+    project = _project(zones=ZONES)
+
+    assert load_text(save_text(project, "Цех"), ProfileCatalog()).project == project
+
+
+def test_current_format_is_2_and_version_1_files_are_upgraded_without_zones():
+    data = json.loads(save_text(_project(zones=ZONES), "Цех"))
+    old = json.loads((DATA / "project_v1.karkas").read_text(encoding="utf-8"))
+
+    assert data["format_version"] == 2
+    assert "zones" not in old
+    assert load_text(json.dumps(old, ensure_ascii=False), ProfileCatalog()).project.zones == ()
+
+
+@pytest.mark.parametrize(
+    ("zones", "message"),
+    [
+        ([{"kind": "sauna", "rect": [0, 0, 1000, 1000], "live_load_kpa": 2}], "назначение зоны"),
+        ([{"kind": "storage", "rect": [0, 0, 1000, 1000], "live_load_kpa": -1}], "повреждён"),
+        ([{"kind": "storage", "rect": [7000, 0, 8000, 1000], "live_load_kpa": 5}], "вне контура"),
+        (
+            [
+                {"kind": "storage", "rect": [0, 0, 2000, 2000], "live_load_kpa": 5},
+                {"kind": "prep", "rect": [1000, 1000, 2500, 1900], "live_load_kpa": 2},
+            ],
+            "пересекается",
+        ),
+    ],
+    ids=["неизвестное назначение", "отрицательная нагрузка", "вне контура", "наложение"],
+)
+def test_broken_zones_give_a_clear_message(zones, message):
+    data = json.loads(save_text(_project(), "Цех"))
+    data["zones"] = zones
+
+    with pytest.raises(ProjectFileError, match=message):
+        load_text(json.dumps(data, ensure_ascii=False), ProfileCatalog())
+
+
+def test_project_saved_by_format_version_2_still_opens():
+    text = (DATA / "project_v2.karkas").read_text(encoding="utf-8")
+
+    loaded = load_text(text, ProfileCatalog())
+
+    assert json.loads(text)["format_version"] == 2
+    assert loaded.project == _project(zones=ZONES)
+    assert summary_note(loaded.summary, analyze(loaded.project)) is None

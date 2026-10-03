@@ -72,9 +72,7 @@ class Zone:
 
 def place_zone(contour: Contour, zones: list[Zone], rect: Rect, kind: str) -> Zone:
     """Новая зона по протянутому прямоугольнику: обрезана по контуру, без наложений."""
-    x0, x1 = sorted((rect[0], rect[2]))
-    y0, y1 = sorted((rect[1], rect[3]))
-    piece = contour.polygon.intersection(box(x0, y0, x1, y1))
+    piece = contour.polygon.intersection(box(*rect))  # box сам упорядочивает углы
     if piece.area <= AREA_TOLERANCE_MM2:
         raise ZoneError("Зона вне контура: протяните прямоугольник внутри плана.")
     bx0, by0, bx1, by1 = piece.bounds
