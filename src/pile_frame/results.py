@@ -1,4 +1,4 @@
-"""Результаты: проверки балок, реакции свай, сварные швы и допущения."""
+"""Результаты: проверки балок, листов ЦСП, реакции свай, сварные швы и допущения."""
 
 from __future__ import annotations
 
@@ -55,7 +55,10 @@ def _table() -> QTableView:
 
 
 class ResultsPanel(QTabWidget):
-    """Вкладки «Балки», «Сваи и реакции», «Швы», «Допущения». Выбор балки сообщает её индекс."""
+    """Вкладки «Балки», «Листы ЦСП», «Сваи и реакции», «Швы», «Допущения».
+
+    Выбор балки сообщает её индекс.
+    """
 
     member_selected = Signal(int)
 
@@ -113,10 +116,30 @@ class ResultsPanel(QTabWidget):
         self.welds = _table()
         self.welds.setModel(weld_proxy)
 
+        self._board_model = QStandardItemModel(0, 8)
+        self._board_model.setHorizontalHeaderLabels(
+            [
+                "Ячейка, мм",
+                "Перемычки",
+                "Пролёт листа, мм",
+                "Равномерная, %",
+                "Сосредоточенная, %",
+                "Прогиб, мм",
+                "Прогиб, %",
+                "Итог",
+            ]
+        )
+        board_proxy = QSortFilterProxyModel()
+        board_proxy.setSourceModel(self._board_model)
+        board_proxy.setSortRole(SORT_ROLE)
+        self.boards = _table()
+        self.boards.setModel(board_proxy)
+
         self.assumptions = QPlainTextEdit(assumptions.as_text())
         self.assumptions.setReadOnly(True)
 
         self.addTab(self.members, "Балки")
+        self.addTab(self.boards, "Листы ЦСП")
         self.addTab(self.piles, "Сваи и реакции")
         self.addTab(self.welds, "Швы")
         self.addTab(self.assumptions, "Допущения")
@@ -125,6 +148,7 @@ class ResultsPanel(QTabWidget):
         self._member_model.setRowCount(0)
         self._pile_model.setRowCount(0)
         self._weld_model.setRowCount(0)
+        self._board_model.setRowCount(0)
         if design is None:
             return
         unsupported = {id(m) for m in design.unsupported_members}
@@ -147,6 +171,25 @@ class ResultsPanel(QTabWidget):
                 _item(verdict, check.utilization),
             ]
             self._member_model.appendRow(row)
+        for cell in design.board_cells:
+            x0, y0, x1, y1 = cell.bounds
+            check = cell.check
+            if cell.jumpers is None:
+                jumpers, verdict = "не помогают", "нужен лист толще"
+            else:
+                jumpers, verdict = str(cell.jumpers), classify(check.utilization).label
+            self._board_model.appendRow(
+                [
+                    _item(f"{x1 - x0:.0f} × {y1 - y0:.0f}", (x1 - x0) * (y1 - y0)),
+                    _item(jumpers, -1 if cell.jumpers is None else cell.jumpers),
+                    _item(f"{check.span_mm:.0f}", check.span_mm),
+                    _item(f"{check.uniform_utilization:.0%}", check.uniform_utilization),
+                    _item(f"{check.point_utilization:.0%}", check.point_utilization),
+                    _item(_fmt(check.deflection_mm), check.deflection_mm),
+                    _item(f"{check.deflection_utilization:.0%}", check.deflection_utilization),
+                    _item(verdict, check.utilization),
+                ]
+            )
         for index, (pile, reaction) in enumerate(design.reactions_kn.items()):
             self._pile_model.appendRow(
                 [

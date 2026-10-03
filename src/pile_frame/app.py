@@ -176,6 +176,7 @@ class PlanView(QGraphicsView):
             if self.show_sheets:
                 self._draw_sheets(self._design)
             self._draw_members(self._design)
+            self._draw_board_issues(self._design)
         self._draw_piles()
         self._draw_preview()
 
@@ -221,12 +222,14 @@ class PlanView(QGraphicsView):
         t = self._theme
         failing = {id(m) for m in design.failing_members()}
         for member in design.members:
-            is_perimeter = member.section.width_mm == member.section.height_mm
             if id(member) in failing:
                 # Не только цвет: перегруженная балка рисуется пунктиром.
                 pen = QPen(QColor(t.fail), member.section.width_mm, Qt.PenStyle.DashLine)
             else:
-                color = t.member_perimeter if is_perimeter else t.member_internal
+                color = {
+                    "perimeter": t.member_perimeter,
+                    "jumper": t.member_jumper,
+                }.get(member.kind, t.member_internal)
                 pen = QPen(QColor(color), member.section.width_mm)
             pen.setCapStyle(Qt.PenCapStyle.FlatCap)
             (x0, y0), (x1, y1) = member.start, member.end
@@ -238,6 +241,22 @@ class PlanView(QGraphicsView):
             (x0, y0), (x1, y1) = member.start, member.end
             line = self._scene.addLine(x0, y0, x1, y1, halo)
             line.setOpacity(0.45)
+
+    def _draw_board_issues(self, design: Design) -> None:
+        """Ячейки, где лист не проходит, и кромки листов без места под саморез."""
+        t = self._theme
+        hatch = QBrush(QColor(t.fail), Qt.BrushStyle.DiagCrossPattern)
+        hatch.setTransform(hatch.transform().scale(1 / PLAN_SCALE, 1 / PLAN_SCALE))
+        for cell in design.board_cells:
+            if not cell.check.passed:
+                x0, y0, x1, y1 = cell.bounds
+                self._scene.addRect(x0, y0, x1 - x0, y1 - y0, QPen(Qt.PenStyle.NoPen), hatch)
+        # Не только цвет: кромка без опоры — пунктир поверх балки.
+        pen = QPen(QColor(t.warning), 24, Qt.PenStyle.DashLine)
+        pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+        for issue in design.bearing_issues:
+            (x0, y0), (x1, y1) = issue.start, issue.end
+            self._scene.addLine(x0, y0, x1, y1, pen)
 
     def _draw_piles(self) -> None:
         t, r = self._theme, PILE_DIAMETER_MM / 2
@@ -384,6 +403,7 @@ class ResultCard(QFrame):
         "Макс. реакция сваи",
         "Листы",
         "Обрезки",
+        "Лист ЦСП",
         "Замечания",
     )
 
@@ -392,6 +412,8 @@ class ResultCard(QFrame):
         self.setObjectName("card")
         self._theme = LIGHT
         self._status: Status | None = None
+        #: Заголовок статуса: подпись статуса или «есть замечания», если запас достаточный.
+        self._label = ""
         self._icon = QLabel()
         self._icon.setFixedSize(20, 20)
         self._icon.hide()
@@ -430,11 +452,15 @@ class ResultCard(QFrame):
 
     def show_design(self, contour: Contour, design: Design) -> None:
         check, member = design.governing_check, design.governing_member
-        utilization = check.utilization
-        has_errors = bool(design.failing_members() or design.piles_outside)
+        board = max((cell.check.utilization for cell in design.board_cells), default=0.0)
+        utilization = max(check.utilization, board)
+        boards_fail = any(not cell.check.passed for cell in design.board_cells)
+        has_errors = bool(design.failing_members() or design.piles_outside or boards_fail)
         self._status = Status.FAIL if has_errors and utilization <= 1.0 else classify(utilization)
-        if design.electrode_issue and self._status is Status.OK:
+        self._label = self._status.label if self._status else ""
+        if (design.electrode_issue or design.bearing_issues) and self._status is Status.OK:
             self._status = Status.WARNING
+            self._label = "Проходит, есть замечания"
         v = self._values
         xs = [x for x, _ in contour.vertices]
         ys = [y for _, y in contour.vertices]
@@ -442,7 +468,8 @@ class ResultCard(QFrame):
         v["Площадь"].setText(f"{_fmt(contour.area_mm2 / 1e6)} м²")
         v["Свай"].setText(str(len(design.piles)))
         v["Не проходят"].setText(f"{len(design.failing_members())} из {len(design.members)}")
-        v["Балка"].setText(f"{member.section.name}, {member.length_mm:.0f} мм")
+        kind = "перемычка " if member.kind == "jumper" else ""
+        v["Балка"].setText(f"{kind}{member.section.name}, {member.length_mm:.0f} мм")
         v["Прочность"].setText(f"{check.strength_utilization:.0%}")
         v["Срез"].setText(f"{check.shear_utilization:.0%}")
         reactions = design.reactions_kn.values()
@@ -461,11 +488,20 @@ class ResultCard(QFrame):
             notes.append("электрод не по п. 14.1.8")
         if design.corners_without_piles:
             notes.append(f"углов без свай: {len(design.corners_without_piles)}")
+        if design.bearing_issues:
+            notes.append(f"опирание листов: {len(design.bearing_issues)} кромок")
         v["Замечания"].setText(", ".join(notes) if notes else "нет")
         layout = design.sheet_layout
         if layout is not None:
             v["Листы"].setText(f"{layout.whole_count} целых, {layout.cut_count} резаных")
             v["Обрезки"].setText(f"{_fmt(layout.offcut_m2)} м²")
+        if design.board_cells:
+            worst = max(cell.check.utilization for cell in design.board_cells)
+            jumpers = sum(1 for m in design.members if m.kind == "jumper")
+            text = f"{worst:.0%}, перемычек {jumpers}"
+            if any(cell.jumpers is None for cell in design.board_cells):
+                text += ", нужен лист толще"
+            v["Лист ЦСП"].setText(text)
         self._refresh_status_style()
 
     def clear(self) -> None:
@@ -481,7 +517,7 @@ class ResultCard(QFrame):
             return
         color = getattr(self._theme, self._status.color_token)
         self._icon.show()
-        self._title.setText(self._status.label)
+        self._title.setText(self._label)
         self._title.setStyleSheet(f"font-weight: 600; font-size: 11pt; color: {color};")
         self._icon.setPixmap(status_icon(self._status, self._theme))
 

@@ -47,6 +47,10 @@ def test_result_card_shows_status_as_text_and_icon(qtbot):
     window = MainWindow()
     qtbot.addWidget(window)
     window.show()
+    # Полка 120 мм: кромкам листов хватает места под саморез — замечаний нет.
+    # Лист 28 мм загружен на 76 % — запас больше 10 %.
+    window.internal_profile.setCurrentText("120×120×5")
+    window.board_fields["thickness_mm"].set_value(28)
 
     _drag(window.plan, (0, 0), (6000, 4000))
 
@@ -170,3 +174,46 @@ def test_welds_and_assumptions_tabs_are_filled(qtbot):
 
     assert window.results.welds.model().rowCount() == len(window.last_design.welds) > 0
     assert "кручени" in window.results.assumptions_text().lower()
+
+
+def test_board_check_jumpers_and_bearing_are_shown(qtbot):
+    # Лист 24 мм на полках 120×60: перемычки в ячейках, кромкам не хватает полки под саморез.
+    window = _window_with_rectangle(qtbot)
+    design = window.last_design
+    jumpers = sum(1 for m in design.members if m.kind == "jumper")
+    assert jumpers > 0 and design.bearing_issues
+
+    card = window.result_card
+    assert card.status() is Status.WARNING
+    assert f"перемычек {jumpers}" in card.value("Лист ЦСП")
+    assert card.value("Балка").startswith("перемычка 40×40×3")  # определяет перемычка
+    assert f"опирание листов: {len(design.bearing_issues)}" in card.value("Замечания")
+    assert window.results.boards.model().rowCount() == len(design.board_cells)
+    assert "ЦСП" in window.results.assumptions_text()
+
+
+def test_remarks_without_overload_are_titled_as_remarks_not_as_low_margin(qtbot):
+    # Лист 28 мм, 4 кПа: наибольшая загрузка 76 % (лист), но кромкам 120×60 не хватает полки.
+    window = _window_with_rectangle(qtbot)
+    field = window.board_fields["thickness_mm"]
+    field.editor.clear()
+    QTest.keyClicks(field.editor, "28")
+    QTest.keyClick(field.editor, Qt.Key.Key_Return)
+
+    card = window.result_card
+    assert window.last_design.bearing_issues
+    assert card.status() is Status.WARNING
+    assert card.status_text() == "Проходит, есть замечания"
+
+
+def test_board_utilization_counts_in_the_card_status(qtbot):
+    # Лист 24 мм на полках 120 мм (замечаний по опиранию нет): элементы каркаса загружены
+    # меньше чем на 60 %, лист — на 95 % → запас меньше 10 %.
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    window.internal_profile.setCurrentText("120×120×5")
+    _drag(window.plan, (0, 0), (6000, 4000))
+
+    assert not window.last_design.bearing_issues
+    assert window.result_card.status_text() == Status.WARNING.label

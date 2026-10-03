@@ -36,6 +36,7 @@ NON_TEXT_PAIRS = [
     ("focus", "background"),
     ("member_perimeter", "plan_background"),
     ("member_internal", "plan_background"),
+    ("member_jumper", "plan_background"),
     ("pile", "plan_background"),
     ("fail", "plan_background"),
     ("outline", "plan_background"),
