@@ -34,7 +34,7 @@ def classify(utilization: float) -> Status:
     return Status.OK
 
 
-#: Заголовок, когда всё проходит с запасом, но есть замечания (электрод, опирание листов).
+#: Заголовок, когда всё проходит с запасом, но есть замечания (электрод, опирание, зоны).
 REMARKS_LABEL = "Проходит, есть замечания"
 
 
@@ -45,6 +45,7 @@ def design_status(design: Design) -> tuple[Status, str, float]:
     boards_fail = any(not cell.check.passed for cell in design.board_cells)
     has_errors = bool(design.failing_members() or design.piles_outside or boards_fail)
     status = Status.FAIL if has_errors and utilization <= 1.0 else classify(utilization)
-    if (design.electrode_issue or design.bearing_issues) and status is Status.OK:
+    remarks = design.electrode_issue or design.bearing_issues or design.remarks
+    if remarks and status is Status.OK:
         return Status.WARNING, REMARKS_LABEL, utilization
     return status, status.label, utilization

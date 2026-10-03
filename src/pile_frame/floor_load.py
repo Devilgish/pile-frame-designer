@@ -12,7 +12,7 @@
 
 from __future__ import annotations
 
-from shapely.geometry import LineString, Polygon
+from shapely.geometry import LineString, Polygon, box
 from shapely.ops import polygonize, unary_union
 
 from pile_frame.contour import Contour, Point
@@ -44,16 +44,31 @@ def _edge_profile(length: float, depth: float) -> list[tuple[float, float]]:
 
 
 def _clip(points: list[tuple[float, float]], start: float, end: float) -> Profile:
-    """Кусочно-линейный профиль на участке [start, end] в координатах стороны."""
+    """Кусочно-линейный профиль на участке [start, end] в координатах стороны.
 
-    def value(t: float) -> float:
-        for (t0, d0), (t1, d1) in zip(points, points[1:], strict=False):
-            if t0 <= t <= t1:
-                return d0 if t1 == t0 else d0 + (d1 - d0) * (t - t0) / (t1 - t0)
-        return 0.0
+    Точки (t, d) по возрастанию t; повтор t с другим d — скачок глубины.
+    """
+    pieces = [(a, b) for a, b in zip(points, points[1:], strict=False) if b[0] > a[0]]
+
+    def piece_at(t: float):
+        for a, b in pieces:
+            if a[0] <= t <= b[0]:
+                return a, b
+        return None
 
     marks = sorted({start, end, *(t for t, _ in points if start < t < end)})
-    return [(t0, t1, value(t0), value(t1)) for t0, t1 in zip(marks, marks[1:], strict=False)]
+    profile = []
+    for t0, t1 in zip(marks, marks[1:], strict=False):
+        piece = piece_at((t0 + t1) / 2)
+        if piece is None:
+            continue
+        (a, da), (b, db) = piece
+
+        def depth(t: float, a=a, b=b, da=da, db=db) -> float:
+            return da + (db - da) * (t - a) / (b - a)
+
+        profile.append((t0, t1, depth(t0), depth(t1)))
+    return profile
 
 
 def floor_cells(contour: Contour, segments: list[tuple[Point, Point]]) -> list[Polygon]:
@@ -73,36 +88,38 @@ def is_rectangular(cell: Polygon) -> bool:
     return abs(cell.area - width * height) <= TOLERANCE_MM * (width + height)
 
 
-def distribute_floor(contour: Contour, segments: list[tuple[Point, Point]]) -> dict[int, Profile]:
-    """Профили грузовой площади для каждой балки (по индексу в ``segments``)."""
-    cells = floor_cells(contour, segments)
+def _rect_edges(cell: Polygon):
+    """Стороны прямоугольной ячейки с их грузовыми фигурами «конверта» (линии под 45°)."""
+    x0, y0, x1, y1 = cell.bounds
+    d = min(x1 - x0, y1 - y0) / 2
+    return [
+        ((x0, y0), (x1, y0), 0, [(x0, y0), (x1, y0), (x1 - d, y0 + d), (x0 + d, y0 + d)]),
+        ((x0, y1), (x1, y1), 0, [(x0, y1), (x1, y1), (x1 - d, y1 - d), (x0 + d, y1 - d)]),
+        ((x0, y0), (x0, y1), 1, [(x0, y0), (x0, y1), (x0 + d, y1 - d), (x0 + d, y0 + d)]),
+        ((x1, y0), (x1, y1), 1, [(x1, y0), (x1, y1), (x1 - d, y1 - d), (x1 - d, y0 + d)]),
+    ]
+
+
+def _distribute(contour, segments, edge_points) -> dict[int, Profile]:
+    """Раздать профили глубины сторон ячеек балкам, лежащим на этих сторонах.
+
+    ``edge_points(cell, start, end, axis, tributary)`` — точки (t, d) профиля вдоль стороны;
+    ``tributary`` — грузовая фигура стороны (для непрямоугольной ячейки ``None``).
+    """
     ordered = [_ordered(s) for s in segments]
     loads: dict[int, Profile] = {i: [] for i in range(len(segments))}
-
-    for cell in cells:
-        min_x, min_y, max_x, max_y = cell.bounds
-        width, height = max_x - min_x, max_y - min_y
-        rectangular = is_rectangular(cell)
-        if rectangular:
-            depth = min(width, height) / 2
-            edges = [
-                ((min_x, min_y), (max_x, min_y), 0),
-                ((min_x, max_y), (max_x, max_y), 0),
-                ((min_x, min_y), (min_x, max_y), 1),
-                ((max_x, min_y), (max_x, max_y), 1),
-            ]
+    for cell in floor_cells(contour, segments):
+        if is_rectangular(cell):
+            edges = _rect_edges(cell)
         else:
-            depth = cell.area / cell.length  # равномерно по периметру
             coords = list(cell.exterior.coords)
-            edges = [_ordered((a, b)) for a, b in zip(coords, coords[1:], strict=False)]
-        for start, end, axis in edges:
+            edges = [(*_ordered((a, b)), None) for a, b in zip(coords, coords[1:], strict=False)]
+        for start, end, axis, tributary in edges:
             length = end[axis] - start[axis]
             if length <= TOLERANCE_MM:
                 continue
+            points = edge_points(cell, start, end, axis, tributary)
             across = 1 - axis
-            points = (
-                _edge_profile(length, depth) if rectangular else [(0.0, depth), (length, depth)]
-            )
             for index, (a, b, seg_axis) in enumerate(ordered):
                 if seg_axis != axis or abs(a[across] - start[across]) > TOLERANCE_MM:
                     continue
@@ -113,3 +130,70 @@ def distribute_floor(contour: Contour, segments: list[tuple[Point, Point]]) -> d
                     offset = start[axis] - a[axis]
                     loads[index].append((t0 + offset, t1 + offset, d0, d1))
     return loads
+
+
+def distribute_floor(contour: Contour, segments: list[tuple[Point, Point]]) -> dict[int, Profile]:
+    """Профили грузовой площади для каждой балки (по индексу в ``segments``)."""
+
+    def full(cell, start, end, axis, tributary):
+        length = end[axis] - start[axis]
+        if tributary is None:
+            depth = cell.area / cell.length  # равномерно по периметру
+            return [(0.0, depth), (length, depth)]
+        x0, y0, x1, y1 = cell.bounds
+        return _edge_profile(length, min(x1 - x0, y1 - y0) / 2)
+
+    return _distribute(contour, segments, full)
+
+
+def _section_length(polygon: Polygon, axis: int, at: float) -> float:
+    """Длина сечения фигуры поперёк стороны (ось ``axis``) в координате ``at``."""
+    x0, y0, x1, y1 = polygon.bounds
+    if axis == 0:
+        line = LineString([(at, y0 - 1), (at, y1 + 1)])
+    else:
+        line = LineString([(x0 - 1, at), (x1 + 1, at)])
+    return polygon.intersection(line).length
+
+
+def _zone_points(piece: Polygon, start: Point, end: Point, axis: int) -> list[tuple[float, float]]:
+    """Профиль глубины части грузовой фигуры, попавшей в зону, вдоль стороны ячейки.
+
+    Сечение выпуклой фигуры меняется линейно между вершинами; значения на концах участка
+    берутся чуть внутри него (на 0,01 мм), поэтому скачки на краях зоны не размываются.
+    """
+    if piece.is_empty or piece.area <= 0:
+        return [(0.0, 0.0), (end[axis] - start[axis], 0.0)]
+    coords = sorted({round(c[axis], 6) for c in piece.exterior.coords})
+    marks = sorted({start[axis], end[axis], *(c for c in coords if start[axis] < c < end[axis])})
+    points = []
+    for a, b in zip(marks, marks[1:], strict=False):
+        delta = min(1e-3 * (b - a), 0.01)
+        va = _section_length(piece, axis, a + delta)
+        vb = _section_length(piece, axis, b - delta)
+        points += [(a - start[axis], va), (b - start[axis], vb)]
+    return points
+
+
+def zone_profiles(
+    contour: Contour, segments: list[tuple[Point, Point]], rects: list[tuple[float, ...]]
+) -> dict[int, list[Profile]]:
+    """Профили грузовой площади в пределах каждой зоны: балка → [профиль зоны 0, зоны 1, …].
+
+    В прямоугольной ячейке берётся часть грузовой фигуры «конверта», попавшая в зону;
+    в непрямоугольной — доля площади зоны в ячейке, равномерно по периметру.
+    """
+    result: dict[int, list[Profile]] = {i: [] for i in range(len(segments))}
+    for rect in rects:
+        zone = box(*rect)
+
+        def inside(cell, start, end, axis, tributary, zone=zone):
+            length = end[axis] - start[axis]
+            if tributary is None:
+                depth = cell.area / cell.length * cell.intersection(zone).area / cell.area
+                return [(0.0, depth), (length, depth)]
+            return _zone_points(Polygon(tributary).intersection(zone), start, end, axis)
+
+        for index, profile in _distribute(contour, segments, inside).items():
+            result[index].append(profile)
+    return result

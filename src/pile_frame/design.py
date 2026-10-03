@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from shapely.geometry import LineString
+from shapely.geometry import LineString, box
 
 from pile_frame.analysis import (
     GRAVITY,
@@ -24,6 +24,7 @@ from pile_frame.materials import C245, Steel
 from pile_frame.sections import Section, TUBE_40x40x3, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.sheets import LongSide, SheetLayout, layout_sheets
 from pile_frame.welds import DEFAULT_ELECTRODE, electrode_issue
+from pile_frame.zones import Zone, zone_remarks
 
 __all__ = ["GRAVITY", "AnalysisError", "gamma_f_live"]
 
@@ -56,6 +57,8 @@ class Project:
     sheet_joints: bool = True
     #: Электрод для ручной сварки примыканий (таблица Г.2).
     electrode: str = DEFAULT_ELECTRODE
+    #: Зоны помещений со своей временной нагрузкой; вне зон действует ``live_load_kpa``.
+    zones: tuple[Zone, ...] = ()
 
     @property
     def outline(self) -> Contour:
@@ -118,6 +121,8 @@ class Design:
     sheet_layout: SheetLayout | None = None
     board_cells: list[BoardCell] = field(default_factory=list)
     bearing_issues: list[BearingIssue] = field(default_factory=list)
+    #: Замечания, не влияющие на прочность: например, камера на ЦСП.
+    remarks: list[str] = field(default_factory=list)
 
     def failing_members(self) -> list[Member]:
         """Элементы, не прошедшие проверку, и балки без опоры на одном из концов."""
@@ -146,6 +151,8 @@ def auto_piles(contour: Contour, step_mm: float) -> list[Point]:
     return [(x, y) for y in ys for x in xs if contour.covers((x, y))]
 
 
+#: Площадь, мм², меньше которой касание ячейки и зоны не учитывается.
+ZONE_TOLERANCE_MM2 = 1.0
 #: Допуск, мм: сваи ближе этого к одной линии считаются стоящими на ней.
 LINE_TOLERANCE_MM = 1.0
 
@@ -251,6 +258,19 @@ def _joint_members(
     return segments
 
 
+def cell_live_load_kpa(cell, project: Project) -> float:
+    """Временная нагрузка для листа в ячейке: наибольшая из зон и пола вне зон, что её касаются."""
+    loads, covered = [], 0.0
+    for zone in project.zones:
+        overlap = cell.intersection(box(*zone.rect)).area
+        if overlap > ZONE_TOLERANCE_MM2:
+            loads.append(zone.live_load_kpa)
+            covered += overlap
+    if cell.area - covered > ZONE_TOLERANCE_MM2:
+        loads.append(project.live_load_kpa)
+    return max(loads)
+
+
 def _jumpers(
     contour: Contour, segments: list[tuple[Point, Point]], project: Project
 ) -> tuple[list[tuple[Point, Point]], list[BoardCell]]:
@@ -264,9 +284,8 @@ def _jumpers(
         min_x, min_y, max_x, max_y = cell.bounds
         width, height = max_x - min_x, max_y - min_y
         short, long = sorted((width, height))
-        count = jumpers_needed(
-            project.board, short_mm=short, long_mm=long, live_load_kpa=project.live_load_kpa
-        )
+        live = cell_live_load_kpa(cell, project)
+        count = jumpers_needed(project.board, short_mm=short, long_mm=long, live_load_kpa=live)
         pitch = long / ((count or 0) + 1)
         for k in range(1, (count or 0) + 1):
             if width >= height:
@@ -274,9 +293,7 @@ def _jumpers(
             else:
                 line = LineString([(min_x, min_y + pitch * k), (max_x, min_y + pitch * k)])
             jumpers += [(g.coords[0], g.coords[-1]) for g in _parts(cell.intersection(line))]
-        check = check_board(
-            project.board, span_mm=min(short, pitch), live_load_kpa=project.live_load_kpa
-        )
+        check = check_board(project.board, span_mm=min(short, pitch), live_load_kpa=live)
         cells.append(BoardCell(cell.bounds, count, check))
     return jumpers, cells
 
@@ -376,4 +393,5 @@ def analyze(project: Project) -> Design:
         sheet_layout=layout,
         board_cells=board_cells,
         bearing_issues=bearing,
+        remarks=zone_remarks(project.zones),
     )

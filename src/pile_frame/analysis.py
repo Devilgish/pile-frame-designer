@@ -16,7 +16,7 @@ import numpy as np
 
 from pile_frame.beam import GAMMA_C, LIVE_SHARE_FOR_DEFLECTION, deflection_limit_mm
 from pile_frame.contour import Contour, Point
-from pile_frame.floor_load import Profile, distribute_floor, loaded_area_mm2
+from pile_frame.floor_load import Profile, distribute_floor, loaded_area_mm2, zone_profiles
 from pile_frame.grillage import Grillage
 from pile_frame.materials import STEEL_E_MPA
 from pile_frame.sections import Section
@@ -152,20 +152,29 @@ def analyze_frame(
     project: Project, contour: Contour, supports: list[Point], members: list[Member]
 ) -> tuple[list[MemberCheck], dict[Point, float], list[NodeWeld]]:
     """Проверки элементов, реакции свай (кН) и сварные примыкания в узлах."""
-    profiles = distribute_floor(contour, [(m.start, m.end) for m in members])
-    live_gamma = gamma_f_live(project.live_load_kpa)
-    # Давление на пол, Н/мм² (1 кПа = 1e-3 Н/мм²), и коэффициент к весу металла.
-    design_combo = (
-        (project.board_load_kpa * GAMMA_F_BOARD + project.live_load_kpa * live_gamma) * 1e-3,
-        GAMMA_F_STEEL,
-    )
-    deflection_combo = (
-        (project.board_load_kpa + LIVE_SHARE_FOR_DEFLECTION * project.live_load_kpa) * 1e-3,
-        1.0,
-    )
+    segments = [(m.start, m.end) for m in members]
+    profiles = distribute_floor(contour, segments)
+    base = project.live_load_kpa
+    # Давление на пол, Н/мм² (1 кПа = 1e-3 Н/мм²): весь пол с общей временной нагрузкой,
+    # а в каждой зоне — добавка (или снижение) до её собственной, со своим γf.
+    design_loads = [
+        (profiles, (project.board_load_kpa * GAMMA_F_BOARD + base * gamma_f_live(base)) * 1e-3)
+    ]
+    deflection_loads = [
+        (profiles, (project.board_load_kpa + LIVE_SHARE_FOR_DEFLECTION * base) * 1e-3)
+    ]
+    if project.zones:
+        by_zone = zone_profiles(contour, segments, [z.rect for z in project.zones])
+        for k, zone in enumerate(project.zones):
+            zone_load = {i: by_zone[i][k] for i in by_zone}
+            p = zone.live_load_kpa
+            design_loads.append(
+                (zone_load, (p * gamma_f_live(p) - base * gamma_f_live(base)) * 1e-3)
+            )
+            deflection_loads.append((zone_load, LIVE_SHARE_FOR_DEFLECTION * (p - base) * 1e-3))
 
-    design, sub_design, nodes_design = _solve(members, profiles, supports, *design_combo)
-    deflection, _, nodes_deflection = _solve(members, profiles, supports, *deflection_combo)
+    design, sub_design, nodes_design = _solve(members, design_loads, supports, GAMMA_F_STEEL)
+    deflection, _, nodes_deflection = _solve(members, deflection_loads, supports, 1.0)
 
     pile_xs = sorted({p[0] for p in supports})
     pile_ys = sorted({p[1] for p in supports})
@@ -290,7 +299,8 @@ def _key(point: Point) -> tuple[int, int]:
     return (round(point[0] / NODE_TOLERANCE_MM), round(point[1] / NODE_TOLERANCE_MM))
 
 
-def _solve(members, profiles, supports, pressure, steel_gamma):
+def _solve(members, loads, supports, steel_gamma):
+    """Грильяж под нагрузками ``loads``: пары (профили грузовой площади, давление, Н/мм²)."""
     model = Grillage()
     keys: dict[tuple[int, int], int] = {}
     support_keys = {_key(p) for p in supports}
@@ -321,8 +331,9 @@ def _solve(members, profiles, supports, pressure, steel_gamma):
             beam = model.beam(ids[k], ids[k + 1], ei)
             start, end = length * k / SUBDIVISIONS, length * (k + 1) / SUBDIVISIONS
             model.line_load(beam, self_weight)
-            for s0, s1, d0, d1 in _clip_profile(profiles[index], start, end):
-                model.line_load(beam, pressure * d0, pressure * d1, s0, s1)
+            for profiles, pressure in loads:
+                for s0, s1, d0, d1 in _clip_profile(profiles[index], start, end):
+                    model.line_load(beam, pressure * d0, pressure * d1, s0, s1)
             beams.append(beam)
         sub_beams.append(beams)
         member_nodes.append(list(zip(ids, points, strict=True)))
