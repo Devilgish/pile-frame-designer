@@ -16,7 +16,7 @@ import numpy as np
 
 from pile_frame.beam import GAMMA_C, LIVE_SHARE_FOR_DEFLECTION, deflection_limit_mm
 from pile_frame.contour import Contour, Point
-from pile_frame.floor_load import Profile, distribute_floor
+from pile_frame.floor_load import Profile, distribute_floor, loaded_area_mm2
 from pile_frame.grillage import Grillage
 from pile_frame.materials import STEEL_E_MPA
 from pile_frame.sections import Section
@@ -32,6 +32,10 @@ GAMMA_F_STEEL = 1.05  # металлические конструкции
 GAMMA_F_BOARD = 1.2  # плиты заводского изготовления
 #: Расчётное сопротивление срезу Rs = 0,58·Ry (СП 16.13330.2017, таблица 2).
 SHEAR_RATIO = 0.58
+#: Сосредоточенная нагрузка на элементы перекрытия, Н, и её γf (СП 20.13330.2016, п. 8.3.4,
+#: 8.3.5). Проверяются перемычки: у балок каркаса она не определяет.
+POINT_LOAD_N = 1500.0
+GAMMA_F_POINT = 1.2
 #: На сколько конечных элементов делится каждая балка (прогибы считаются в узлах).
 SUBDIVISIONS = 4
 NODE_TOLERANCE_MM = 0.5
@@ -175,6 +179,17 @@ def analyze_frame(
             shears.append(abs(design.shear_at(beam, 0.0)))
             shears.append(abs(design.shear_at(beam, length)))
         max_moment, max_shear = max(moments), max(shears)
+        if member.kind == "jumper":
+            # Разрезная перемычка: сосредоточенная нагрузка посередине пролёта и постоянная.
+            length = member.length_mm
+            depth = loaded_area_mm2(profiles[index]) / length
+            dead = (
+                project.board_load_kpa * 1e-3 * GAMMA_F_BOARD * depth
+                + section.mass_kg_m * GRAVITY / 1e3 * GAMMA_F_STEEL
+            )
+            point = GAMMA_F_POINT * POINT_LOAD_N
+            max_moment = max(max_moment, point * length / 4 + dead * length**2 / 8)
+            max_shear = max(max_shear, point + dead * length / 2)
         ry = project.steel.ry_mpa(section.thickness_mm)
         strength = max_moment / (section.wx_cm3 * 1e3 * ry * GAMMA_C)
         tau = (
@@ -190,7 +205,7 @@ def analyze_frame(
         worst: tuple[float, float] | None = None  # прогиб и предел в худшей точке
         for node, point in nodes_deflection[index]:
             span = min(_bay(pile_xs, point[0]), _bay(pile_ys, point[1]))
-            if math.isinf(span):
+            if math.isinf(span) or member.kind == "jumper":
                 span = member.length_mm
             limit = deflection_limit_mm(span)
             value = abs(deflection.deflection(node))

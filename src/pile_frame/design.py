@@ -15,10 +15,11 @@ from pile_frame.analysis import (
     analyze_frame,
     gamma_f_live,
 )
-from pile_frame.board_check import BoardCheck, check_board, jumpers_needed
+from pile_frame.bearing import BearingIssue, bearing_issues
+from pile_frame.board_check import BoardCheck, check_board, edge_distance_mm, jumpers_needed
 from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour, Point
-from pile_frame.floor_load import floor_cells, is_rectangular
+from pile_frame.floor_load import floor_cells
 from pile_frame.materials import C245, Steel
 from pile_frame.sections import Section, TUBE_40x40x3, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.sheets import LongSide, SheetLayout, layout_sheets
@@ -116,6 +117,7 @@ class Design:
     unsupported_members: list[Member] = field(default_factory=list)
     sheet_layout: SheetLayout | None = None
     board_cells: list[BoardCell] = field(default_factory=list)
+    bearing_issues: list[BearingIssue] = field(default_factory=list)
 
     def failing_members(self) -> list[Member]:
         """Элементы, не прошедшие проверку, и балки без опоры на одном из концов."""
@@ -271,8 +273,7 @@ def _jumpers(
                 line = LineString([(min_x + pitch * k, min_y), (min_x + pitch * k, max_y)])
             else:
                 line = LineString([(min_x, min_y + pitch * k), (max_x, min_y + pitch * k)])
-            part = line if is_rectangular(cell) else cell.intersection(line)
-            jumpers += [(g.coords[0], g.coords[-1]) for g in _parts(part)]
+            jumpers += [(g.coords[0], g.coords[-1]) for g in _parts(cell.intersection(line))]
         check = check_board(
             project.board, span_mm=min(short, pitch), live_load_kpa=project.live_load_kpa
         )
@@ -349,6 +350,14 @@ def analyze(project: Project) -> Design:
     ]
     unsupported = [m for m in members if m.start in corners or m.end in corners]
     checks, reactions, welds = analyze_frame(project, contour, supports, members)
+    bearing = []
+    if project.sheet_joints:
+        bearing = bearing_issues(
+            contour,
+            layout,
+            [(m.start, m.end, m.section) for m in members],
+            edge_distance_mm(project.board.thickness_mm),
+        )
     thickness = min((m.section.thickness_mm for m in members), default=4.0)
     issue = electrode_issue(project.steel, project.electrode, thickness_mm=thickness)
     check, member = max(zip(checks, members, strict=True), key=lambda cm: cm[0].utilization)
@@ -366,4 +375,5 @@ def analyze(project: Project) -> Design:
         unsupported_members=unsupported,
         sheet_layout=layout,
         board_cells=board_cells,
+        bearing_issues=bearing,
     )
