@@ -30,6 +30,9 @@ class WeldCheck:
     length_mm: float
     governing: str  # «металл шва» или «граница сплавления»
     utilization: float
+    #: Расчётные сопротивления металла шва и металла границы сплавления, Н/мм².
+    rwf_mpa: float = 0.0
+    rwz_mpa: float = 0.0
 
 
 def fillet_leg_mm(section: Section) -> int:
@@ -66,4 +69,4 @@ def check_weld(force_n: float, section: Section, steel: Steel, electrode: str) -
         governing, capacity = "металл шва", BETA_F * leg * length * rwf * GAMMA_C
     else:
         governing, capacity = "граница сплавления", BETA_Z * leg * length * rwz * GAMMA_C
-    return WeldCheck(abs(force_n) / 1e3, leg, length, governing, abs(force_n) / capacity)
+    return WeldCheck(abs(force_n) / 1e3, leg, length, governing, abs(force_n) / capacity, rwf, rwz)

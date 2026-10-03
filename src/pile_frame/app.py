@@ -49,9 +49,10 @@ from pile_frame.inputs import NumberField, ProfilesDialog
 from pile_frame.issues import Issue, errors
 from pile_frame.materials import C245, STEELS
 from pile_frame.qt_theme import THEME_MODES, apply_theme, resolve_theme, status_icon
+from pile_frame.report import Report, ReportMeta, build_report
 from pile_frame.results import ResultsPanel
 from pile_frame.sections import ProfileCatalog, TUBE_120x60x4, TUBE_120x120x5
-from pile_frame.status import Status, classify
+from pile_frame.status import Status, design_status
 from pile_frame.theme import LIGHT, Theme
 from pile_frame.welds import DEFAULT_ELECTRODE, ELECTRODES
 
@@ -452,15 +453,7 @@ class ResultCard(QFrame):
 
     def show_design(self, contour: Contour, design: Design) -> None:
         check, member = design.governing_check, design.governing_member
-        board = max((cell.check.utilization for cell in design.board_cells), default=0.0)
-        utilization = max(check.utilization, board)
-        boards_fail = any(not cell.check.passed for cell in design.board_cells)
-        has_errors = bool(design.failing_members() or design.piles_outside or boards_fail)
-        self._status = Status.FAIL if has_errors and utilization <= 1.0 else classify(utilization)
-        self._label = self._status.label if self._status else ""
-        if (design.electrode_issue or design.bearing_issues) and self._status is Status.OK:
-            self._status = Status.WARNING
-            self._label = "Проходит, есть замечания"
+        self._status, self._label, _ = design_status(design)
         v = self._values
         xs = [x for x, _ in contour.vertices]
         ys = [y for _, y in contour.vertices]
@@ -563,6 +556,7 @@ class MainWindow(QMainWindow):
         self.result_card = ResultCard()
         self.results = ResultsPanel()
         self.last_design: Design | None = None
+        self.last_project: Project | None = None
 
         self.catalog = ProfileCatalog.from_json(str(_settings().value("profiles", "[]")))
         self.perimeter_profile = QComboBox()
@@ -872,25 +866,25 @@ class MainWindow(QMainWindow):
             self.plan.show_design(None)
             self.results.show_design(None)
             self.last_design = None
+            self.last_project = None
             self.result_card.clear()
             return
-        design = analyze(
-            Project(
-                contour=contour,
-                piles=self.editor.piles,
-                pile_step_mm=self.pile_step.value(),
-                live_load_kpa=self.live_load.value(),
-                perimeter_section=self.catalog.get(self.perimeter_profile.currentText()),
-                internal_section=self.catalog.get(self.internal_profile.currentText()),
-                steel=STEELS[self.steel.currentText()],
-                electrode=self.electrode.currentText(),
-                board=board,
-                sheet_long_side=self.sheet_long_side.currentData(),
-                sheet_offset_mm=sheets[0],
-                sheet_gap_mm=sheets[1],
-            )
+        project = Project(
+            contour=contour,
+            piles=self.editor.piles,
+            pile_step_mm=self.pile_step.value(),
+            live_load_kpa=self.live_load.value(),
+            perimeter_section=self.catalog.get(self.perimeter_profile.currentText()),
+            internal_section=self.catalog.get(self.internal_profile.currentText()),
+            steel=STEELS[self.steel.currentText()],
+            electrode=self.electrode.currentText(),
+            board=board,
+            sheet_long_side=self.sheet_long_side.currentData(),
+            sheet_offset_mm=sheets[0],
+            sheet_gap_mm=sheets[1],
         )
-        self.last_design = design
+        design = analyze(project)
+        self.last_project, self.last_design = project, design
         theme = resolve_theme(self._theme_mode)
         if design.electrode_issue:
             self.electrode_issue.setText("Внимание: " + design.electrode_issue)
@@ -901,6 +895,12 @@ class MainWindow(QMainWindow):
         self.plan.show_design(design)
         self.results.show_design(design)
         self.result_card.show_design(contour, design)
+
+    def build_report(self, meta: ReportMeta) -> Report:
+        """Расчётная записка по текущему результату."""
+        if self.last_project is None or self.last_design is None:
+            raise ValueError("Нет результата расчёта: нарисуйте контур.")
+        return build_report(self.last_project, self.last_design, meta)
 
     def result_text(self) -> str:
         return self.result_card.text()

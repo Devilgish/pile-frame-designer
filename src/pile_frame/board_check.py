@@ -47,25 +47,42 @@ def bending_strength_mpa(thickness_mm: float) -> float:
     return 9.0
 
 
-def _point_moment(span_mm: float, thickness_mm: float, force_n: float) -> float:
-    """Момент под сосредоточенной нагрузкой в пластине, Н·мм на 1 мм ширины."""
+def load_radius_mm(thickness_mm: float) -> float:
+    """Радиус круга, заменяющего площадку сосредоточенной нагрузки, мм."""
     radius = POINT_PATCH_MM / math.sqrt(math.pi)  # круг той же площади
     if radius < 1.724 * thickness_mm:
         # Поправка на толщину пластины (Тимошенко, «Пластинки и оболочки», § 19).
         radius = math.sqrt(1.6 * radius**2 + thickness_mm**2) - 0.675 * thickness_mm
-    log = math.log(2 * span_mm / (math.pi * radius))
+    return radius
+
+
+def _point_moment(span_mm: float, thickness_mm: float, force_n: float) -> float:
+    """Момент под сосредоточенной нагрузкой в пластине, Н·мм на 1 мм ширины."""
+    log = math.log(2 * span_mm / (math.pi * load_radius_mm(thickness_mm)))
     return force_n / (4 * math.pi) * ((1 + POISSON) * log + 1)
 
 
 @dataclass(frozen=True)
 class BoardCheck:
-    """Результат проверки листа на пролёте ``span_mm``."""
+    """Результат проверки листа на пролёте ``span_mm`` и промежуточные величины для отчёта.
+
+    Нагрузки — Н/мм², моменты — Н·мм и момент сопротивления — мм³ на 1 мм ширины,
+    сопротивления — Н/мм², жёсткость E·I — Н·мм²/мм с учётом ползучести.
+    """
 
     span_mm: float
     uniform_utilization: float
     point_utilization: float
     deflection_mm: float
     deflection_limit_mm: float
+    design_load: float = 0.0
+    uniform_moment: float = 0.0
+    point_moment: float = 0.0
+    section_modulus: float = 0.0
+    strength_medium: float = 0.0
+    strength_short: float = 0.0
+    long_term_load: float = 0.0
+    stiffness: float = 0.0
 
     @property
     def deflection_utilization(self) -> float:
@@ -88,20 +105,28 @@ def check_board(board: BoardSpec, *, span_mm: float, live_load_kpa: float) -> Bo
     strength = bending_strength_mpa(t) / GAMMA_M
 
     q = GAMMA_F_BOARD * dead + gamma_f_live(live_load_kpa) * live
-    uniform = q * span_mm**2 / 8 / section_modulus / (KMOD_MEDIUM * strength)
+    uniform_moment = q * span_mm**2 / 8
+    medium, short = KMOD_MEDIUM * strength, KMOD_SHORT * strength
 
     point_moment = _point_moment(span_mm, t, GAMMA_F_POINT * POINT_LOAD_N)
     point_moment += GAMMA_F_BOARD * dead * span_mm**2 / 8
-    point = point_moment / section_modulus / (KMOD_SHORT * strength)
     q_long = dead + LIVE_SHARE_FOR_DEFLECTION * live
     stiffness = BOARD_E_MPA / (1 + KDEF) * t**3 / 12
     deflection = 5 * q_long * span_mm**4 / (384 * stiffness)
     return BoardCheck(
         span_mm=span_mm,
-        uniform_utilization=uniform,
-        point_utilization=point,
+        uniform_utilization=uniform_moment / section_modulus / medium,
+        point_utilization=point_moment / section_modulus / short,
         deflection_mm=deflection,
         deflection_limit_mm=deflection_limit_mm(span_mm),
+        design_load=q,
+        uniform_moment=uniform_moment,
+        point_moment=point_moment,
+        section_modulus=section_modulus,
+        strength_medium=medium,
+        strength_short=short,
+        long_term_load=q_long,
+        stiffness=stiffness,
     )
 
 

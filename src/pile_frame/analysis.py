@@ -69,6 +69,8 @@ class MemberCheck:
     max_shear_kn: float
     web_utilization: float = 0.0
     flange_utilization: float = 0.0
+    #: Пролёт, по которому взят предельный прогиб (таблица Д.1), мм.
+    deflection_span_mm: float = 0.0
 
     @property
     def deflection_utilization(self) -> float:
@@ -202,7 +204,7 @@ def analyze_frame(
             section, ry_mpa=ry, sigma_c_mpa=max_moment / (section.wx_cm3 * 1e3 * GAMMA_C)
         )
 
-        worst: tuple[float, float] | None = None  # прогиб и предел в худшей точке
+        worst: tuple[float, float, float] | None = None  # прогиб, предел, пролёт
         for node, point in nodes_deflection[index]:
             span = min(_bay(pile_xs, point[0]), _bay(pile_ys, point[1]))
             if math.isinf(span) or member.kind == "jumper":
@@ -210,7 +212,7 @@ def analyze_frame(
             limit = deflection_limit_mm(span)
             value = abs(deflection.deflection(node))
             if worst is None or value / limit > worst[0] / worst[1]:
-                worst = (value, limit)
+                worst = (value, limit, span)
         checks.append(
             MemberCheck(
                 strength_utilization=strength,
@@ -221,6 +223,7 @@ def analyze_frame(
                 max_shear_kn=max_shear / 1e3,
                 web_utilization=stability.web_utilization,
                 flange_utilization=stability.flange_utilization,
+                deflection_span_mm=worst[2],
             )
         )
 

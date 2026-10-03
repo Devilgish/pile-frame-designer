@@ -1,11 +1,14 @@
 """Smoke-тест окна: нарисовал контур мышью → сваи, каркас и итог проверки."""
 
+import datetime
+
 from PySide6.QtCore import QPointF, Qt
 from PySide6.QtGui import QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 from pile_frame.app import MainWindow
+from pile_frame.report import ReportMeta
 from pile_frame.status import Status
 from pile_frame.theme import DARK
 
@@ -217,3 +220,29 @@ def test_board_utilization_counts_in_the_card_status(qtbot):
 
     assert not window.last_design.bearing_issues
     assert window.result_card.status_text() == Status.WARNING.label
+
+
+def _rows(view):
+    model = view.model()
+    return sorted(
+        tuple(model.index(r, c).data() for c in range(model.columnCount()))
+        for r in range(model.rowCount())
+    )
+
+
+def test_report_repeats_the_numbers_shown_in_the_window(qtbot):
+    window = _window_with_rectangle(qtbot)
+    meta = ReportMeta(object_name="Цех", author="Исполнитель", date=datetime.date(2026, 10, 3))
+
+    report = window.build_report(meta)
+
+    tables = {t.title: t for t in report.tables()}
+    results = window.results
+    for view, title in (
+        (results.members, "Элементы каркаса"),
+        (results.boards, "Ячейки листов ЦСП"),
+        (results.piles, "Реакции свай"),
+        (results.welds, "Сварные швы"),
+    ):
+        assert sorted(tables[title].rows) == _rows(view), title
+    assert window.result_card.status_text() in report.summary()
