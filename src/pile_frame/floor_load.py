@@ -74,10 +74,11 @@ def _clip(points: list[tuple[float, float]], start: float, end: float) -> Profil
 def floor_cells(contour: Contour, segments: list[tuple[Point, Point]]) -> list[Polygon]:
     """Ячейки пола внутри контура, на которые его делят балки."""
     lines = [LineString(s) for s in segments] + [contour.polygon.boundary]
+    inside = contour.polygon.buffer(TOLERANCE_MM)
     return [
         cell
         for cell in polygonize(unary_union(lines))
-        if contour.polygon.buffer(TOLERANCE_MM).contains(cell.representative_point())
+        if inside.contains(cell.representative_point())
     ]
 
 

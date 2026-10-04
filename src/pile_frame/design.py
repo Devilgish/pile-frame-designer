@@ -30,6 +30,9 @@ from pile_frame.zones import Zone, zone_remarks
 __all__ = ["GRAVITY", "AnalysisError", "gamma_f_live"]
 
 
+MemberKey = tuple[Point, Point]
+
+
 @dataclass(frozen=True, kw_only=True)
 class Project:
     """Исходные данные проекта.
@@ -62,6 +65,8 @@ class Project:
     zones: tuple[Zone, ...] = ()
     #: Оборудование на плане: вес по габариту сверх временной нагрузки.
     equipment: tuple[Equipment, ...] = ()
+    #: Точечные усиления: балка (по концам, ``member_key``) → более тяжёлый профиль.
+    upgrades: tuple[tuple[MemberKey, Section], ...] = ()
 
     @property
     def outline(self) -> Contour:
@@ -92,6 +97,16 @@ class Member:
     @property
     def length_mm(self) -> float:
         return math.dist(self.start, self.end)
+
+    @property
+    def mass_kg(self) -> float:
+        return self.length_mm / 1e3 * self.section.mass_kg_m
+
+
+def member_key(member: Member) -> MemberKey:
+    """Ключ балки, не зависящий от направления: концы по возрастанию."""
+    a, b = sorted((member.start, member.end))
+    return (a, b)
 
 
 @dataclass(frozen=True)
@@ -128,6 +143,11 @@ class Design:
     remarks: list[str] = field(default_factory=list)
     #: Расчётный вес всего оборудования, кН.
     equipment_load_kn: float = 0.0
+
+    @property
+    def steel_mass_kg(self) -> float:
+        """Масса металла каркаса (балки, перемычки, усиления), кг; сваи не входят."""
+        return sum(m.mass_kg for m in self.members)
 
     def failing_members(self) -> list[Member]:
         """Элементы, не прошедшие проверку, и балки без опоры на одном из концов."""
@@ -333,17 +353,30 @@ def _members(
     typed += [(seg, project.internal_section, "beam") for seg in internal]
     typed += [(seg, project.jumper_section, "jumper") for seg in jumpers]
     members = [Member(a, b, section, kind) for (a, b), section, kind in _split_at_nodes(typed)]
+    if project.upgrades:
+        stronger = dict(project.upgrades)
+        members = [
+            Member(m.start, m.end, stronger.get(member_key(m), m.section), m.kind) for m in members
+        ]
     return members, cells
 
 
 def _split_at_nodes(typed: list[tuple[tuple[Point, Point], Section, str]]):
     """Разрезать балки в узлах, где к ним примыкают другие балки (Т-образные примыкания)."""
     ends = {p for (a, b), _, _ in typed for p in (a, b)}
+    # Индекс концов по линиям: горизонтальной балке нужны только точки с той же y и т. д.
+    by_line: tuple[dict[int, list[Point]], dict[int, list[Point]]] = ({}, {})
+    for point in ends:
+        for axis in (0, 1):
+            by_line[axis].setdefault(round(point[1 - axis]), []).append(point)
     result = []
     for (a, b), section, kind in typed:
+        axis = 0 if abs(a[1] - b[1]) <= LINE_TOLERANCE_MM else 1  # вдоль X или вдоль Y
+        level = round(a[1 - axis])
+        near = [p for key in (level - 1, level, level + 1) for p in by_line[axis].get(key, [])]
         inner = [
             p
-            for p in ends
+            for p in near
             if p not in (a, b)
             and _on_segment(p, a, b)
             and LINE_TOLERANCE_MM < math.dist(a, p) < math.dist(a, b) - LINE_TOLERANCE_MM
@@ -353,7 +386,27 @@ def _split_at_nodes(typed: list[tuple[tuple[Point, Point], Section, str]]):
     return result
 
 
-def analyze(project: Project) -> Design:
+@dataclass(frozen=True)
+class Frame:
+    """Геометрия каркаса без расчёта: сваи, раскладка, элементы, проверка листа по ячейкам."""
+
+    contour: Contour
+    piles: list[Point]
+    supports: list[Point]
+    outside: list[Point]
+    layout: SheetLayout
+    members: list[Member]
+    board_cells: list[BoardCell]
+    corners: list[Point]
+    unsupported: list[Member]
+
+    @property
+    def steel_mass_kg(self) -> float:
+        return sum(m.mass_kg for m in self.members)
+
+
+def frame(project: Project) -> Frame:
+    """Построить каркас по исходным данным (быстро: без расчёта грильяжа)."""
     contour = project.outline
     piles = (
         list(project.piles)
@@ -378,6 +431,16 @@ def analyze(project: Project) -> Design:
         if not any(math.dist(v, p) <= LINE_TOLERANCE_MM for p in supports)
     ]
     unsupported = [m for m in members if m.start in corners or m.end in corners]
+    return Frame(
+        contour, piles, supports, outside, layout, members, board_cells, corners, unsupported
+    )
+
+
+def analyze(project: Project) -> Design:
+    built = frame(project)
+    contour, piles, supports, outside = built.contour, built.piles, built.supports, built.outside
+    layout, members, board_cells = built.layout, built.members, built.board_cells
+    corners, unsupported = built.corners, built.unsupported
     checks, reactions, welds = analyze_frame(project, contour, supports, members)
     bearing = []
     if project.sheet_joints:

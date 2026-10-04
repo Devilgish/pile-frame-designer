@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 from shapely.geometry import Point as ShapelyPoint
 from shapely.geometry import Polygon
@@ -43,8 +44,9 @@ class Contour:
     def area_mm2(self) -> float:
         return self.polygon.area
 
-    @property
+    @cached_property
     def polygon(self) -> Polygon:
+        """Многоугольник shapely; строится один раз (контур неизменяемый)."""
         return Polygon(self.vertices)
 
     def covers(self, point: Point) -> bool:
