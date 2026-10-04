@@ -19,6 +19,7 @@ from pile_frame.bearing import BearingIssue, bearing_issues
 from pile_frame.board_check import BoardCheck, check_board, edge_distance_mm, jumpers_needed
 from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour, Point
+from pile_frame.equipment import Equipment
 from pile_frame.floor_load import floor_cells
 from pile_frame.materials import C245, Steel
 from pile_frame.sections import Section, TUBE_40x40x3, TUBE_120x60x4, TUBE_120x120x5
@@ -59,6 +60,8 @@ class Project:
     electrode: str = DEFAULT_ELECTRODE
     #: Зоны помещений со своей временной нагрузкой; вне зон действует ``live_load_kpa``.
     zones: tuple[Zone, ...] = ()
+    #: Оборудование на плане: вес по габариту сверх временной нагрузки.
+    equipment: tuple[Equipment, ...] = ()
 
     @property
     def outline(self) -> Contour:
@@ -123,6 +126,8 @@ class Design:
     bearing_issues: list[BearingIssue] = field(default_factory=list)
     #: Замечания, не влияющие на прочность: например, камера на ЦСП.
     remarks: list[str] = field(default_factory=list)
+    #: Расчётный вес всего оборудования, кН.
+    equipment_load_kn: float = 0.0
 
     def failing_members(self) -> list[Member]:
         """Элементы, не прошедшие проверку, и балки без опоры на одном из концов."""
@@ -259,7 +264,8 @@ def _joint_members(
 
 
 def cell_live_load_kpa(cell, project: Project) -> float:
-    """Временная нагрузка для листа в ячейке: наибольшая из зон и пола вне зон, что её касаются."""
+    """Временная нагрузка для листа в ячейке, кПа: наибольшая из касающихся её зон и пола вне
+    зон плюс давление оборудования, стоящего в ячейке."""
     loads, covered = [], 0.0
     for zone in project.zones:
         overlap = cell.intersection(box(*zone.rect)).area
@@ -268,7 +274,13 @@ def cell_live_load_kpa(cell, project: Project) -> float:
             covered += overlap
     if cell.area - covered > ZONE_TOLERANCE_MM2:
         loads.append(project.live_load_kpa)
-    return max(loads)
+    # Оборудование в ячейке — сверх нагрузки зоны, всем своим давлением (в запас).
+    extra = 0.0
+    for item in project.equipment:
+        footprint = box(*item.rect)
+        if cell.intersection(footprint).area > ZONE_TOLERANCE_MM2:
+            extra += item.type.normative_weight_kn / (footprint.area / 1e6)
+    return max(loads) + extra
 
 
 def _jumpers(
@@ -394,4 +406,5 @@ def analyze(project: Project) -> Design:
         board_cells=board_cells,
         bearing_issues=bearing,
         remarks=zone_remarks(project.zones),
+        equipment_load_kn=sum(e.type.design_weight_kn for e in project.equipment),
     )

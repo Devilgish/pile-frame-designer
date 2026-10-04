@@ -173,6 +173,16 @@ def analyze_frame(
             )
             deflection_loads.append((zone_load, LIVE_SHARE_FOR_DEFLECTION * (p - base) * 1e-3))
 
+    if project.equipment:
+        # Вес оборудования — равномерно по габариту; в прогиб идёт целиком (длительная нагрузка).
+        by_item = zone_profiles(contour, segments, [e.rect for e in project.equipment])
+        for k, item in enumerate(project.equipment):
+            x0, y0, x1, y1 = item.rect
+            area = (x1 - x0) * (y1 - y0)
+            item_load = {i: by_item[i][k] for i in by_item}
+            design_loads.append((item_load, item.type.design_weight_kn * 1e3 / area))
+            deflection_loads.append((item_load, item.type.normative_weight_kn * 1e3 / area))
+
     design, sub_design, nodes_design = _solve(members, design_loads, supports, GAMMA_F_STEEL)
     deflection, _, nodes_deflection = _solve(members, deflection_loads, supports, 1.0)
 
