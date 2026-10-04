@@ -12,6 +12,8 @@ import math
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy import sparse
+from scipy.sparse.linalg import splu
 
 TOLERANCE_MM = 1e-6
 #: Узлы и веса квадратуры Гаусса: точна для нагрузки, линейной по длине участка.
@@ -111,8 +113,11 @@ class Grillage:
         return total
 
     def solve(self) -> GrillageResult:
+        """Собрать разреженную матрицу жёсткости и решить систему (LU-разложение)."""
         n = 3 * len(self.nodes)
-        stiffness = np.zeros((n, n))
+        rows: list[int] = []
+        cols: list[int] = []
+        values: list[float] = []
         loads = np.zeros(n)
         self._element_cache = []
         for beam in self.beams:
@@ -120,17 +125,31 @@ class Grillage:
             k = _stiffness(beam.ei, beam.length(self.nodes))
             fixed_end = self._fixed_end(beam)
             self._element_cache.append((dofs, k, fixed_end))
-            stiffness[np.ix_(dofs, dofs)] += k
+            for a in range(4):
+                for b in range(4):
+                    rows.append(dofs[a])
+                    cols.append(dofs[b])
+                    values.append(k[a, b])
             loads[dofs] += fixed_end
         for node, force in self.point_loads.items():
             loads[3 * node] += force
 
+        stiffness = sparse.csc_matrix((values, (rows, cols)), shape=(n, n))
+        diagonal = stiffness.diagonal()
         fixed = {3 * s for s in self.supports}
         # Степени свободы без жёсткости (поворот, к которому не подходит ни одна балка).
-        fixed |= {d for d in range(n) if abs(stiffness[d, d]) < 1e-12}
-        free = [d for d in range(n) if d not in fixed]
+        fixed |= {d for d in range(n) if abs(diagonal[d]) < 1e-12}
+        free = np.array([d for d in range(n) if d not in fixed], dtype=int)
         displacements = np.zeros(n)
-        displacements[free] = np.linalg.solve(stiffness[np.ix_(free, free)], loads[free])
+        if free.size:
+            reduced = stiffness[free][:, free].tocsc()
+            try:
+                solution = splu(reduced).solve(loads[free])
+            except RuntimeError as error:  # «matrix is exactly singular»
+                raise np.linalg.LinAlgError(str(error)) from error
+            if not np.all(np.isfinite(solution)):
+                raise np.linalg.LinAlgError("Система вырождена.")
+            displacements[free] = solution
         return GrillageResult(self, displacements)
 
 
