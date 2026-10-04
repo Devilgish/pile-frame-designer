@@ -4,6 +4,7 @@ import pytest
 
 from pile_frame.contour import Contour
 from pile_frame.editor import PlanEditor
+from pile_frame.equipment import EquipmentError, EquipmentType
 from pile_frame.zones import Zone, ZoneError
 
 SQUARE = Contour.from_points([(0, 0), (4000, 0), (4000, 4000), (0, 4000)])
@@ -95,3 +96,46 @@ def test_smaller_contour_keeps_zones_that_still_fit_and_trims_the_rest():
     editor.set_contour(Contour.from_points([(0, 0), (4000, 0), (4000, 2000), (0, 2000)]))
 
     assert [z.rect for z in editor.zones] == [(0, 0, 1000, 1000), (2000, 1000, 4000, 2000)]
+
+
+MIXER = EquipmentType("Тестомес спиральный 60 л", 800, 450, own_kg=200, content_kg=50)
+
+
+def test_equipment_is_placed_moved_turned_and_removed_with_undo():
+    editor = PlanEditor(pile_step_mm=2000)
+    editor.set_contour(SQUARE)
+
+    editor.add_equipment(MIXER, (1000, 1000))
+    editor.move_equipment(0, (3000, 3000))
+    editor.rotate_equipment(0)
+    assert editor.equipment[0].rect == (2775.0, 2600.0, 3225.0, 3400.0)
+
+    editor.remove_equipment(0)
+    assert editor.equipment == ()
+    editor.undo()  # удаление
+    editor.undo()  # поворот
+    assert editor.equipment[0].centre == (3000.0, 3000.0) and not editor.equipment[0].rotated
+
+
+def test_equipment_that_does_not_fit_leaves_the_plan_unchanged():
+    editor = PlanEditor(pile_step_mm=2000)
+    editor.set_contour(SQUARE)
+    editor.add_equipment(MIXER, (1000, 1000))
+
+    with pytest.raises(EquipmentError):
+        editor.move_equipment(0, (3900, 1000))
+    with pytest.raises(EquipmentError):
+        editor.add_equipment(MIXER, (-500, 1000))
+    assert editor.equipment[0].centre == (1000.0, 1000.0)
+    assert len(editor.equipment) == 1
+
+
+def test_smaller_contour_drops_equipment_left_outside():
+    editor = PlanEditor(pile_step_mm=2000)
+    editor.set_contour(SQUARE)
+    editor.add_equipment(MIXER, (1000, 1000))
+    editor.add_equipment(MIXER, (1000, 3000))
+
+    editor.set_contour(Contour.from_points([(0, 0), (4000, 0), (4000, 2000), (0, 2000)]))
+
+    assert [e.centre for e in editor.equipment] == [(1000.0, 1000.0)]

@@ -16,6 +16,14 @@ from typing import Any
 from pile_frame.boards import BoardSpec, validate_board
 from pile_frame.contour import Contour, ContourError
 from pile_frame.design import Design, Project
+from pile_frame.equipment import (
+    Equipment,
+    EquipmentError,
+    EquipmentLibrary,
+    EquipmentType,
+    place_equipment,
+    validate_equipment,
+)
 from pile_frame.issues import errors
 from pile_frame.materials import STEELS
 from pile_frame.sections import ProfileCatalog, Section
@@ -25,8 +33,8 @@ from pile_frame.welds import ELECTRODES
 from pile_frame.zones import PRESETS, Zone, ZoneError, place_zone
 
 APP_ID = "pile-frame-designer"
-#: 1 — исходный формат; 2 — добавлены зоны помещений.
-FORMAT_VERSION = 2
+#: 1 — исходный формат; 2 — добавлены зоны помещений; 3 — оборудование.
+FORMAT_VERSION = 3
 EXTENSION = ".karkas"
 
 
@@ -37,7 +45,16 @@ def _v1_to_v2(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {1: _v1_to_v2}
+def _v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
+    """В формате 2 оборудования не было."""
+    data["equipment"] = []
+    return data
+
+
+MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
+    1: _v1_to_v2,
+    2: _v2_to_v3,
+}
 
 
 class ProjectFileError(ValueError):
@@ -134,6 +151,10 @@ def save_text(project: Project, object_name: str, design: Design | None = None) 
             }
             for z in project.zones
         ],
+        "equipment": [
+            {"type": asdict(e.type), "centre": list(e.centre), "rotated": e.rotated}
+            for e in project.equipment
+        ],
         "summary": None if design is None else summarize(design),
     }
     text = json.dumps(data, ensure_ascii=False, indent=2)
@@ -198,8 +219,56 @@ def _add(catalog: ProfileCatalog, section: Section) -> None:
         raise ProjectFileError(f"В файле неверный профиль «{section.name}»: {issues[0].message}")
 
 
-def load_text(text: str, catalog: ProfileCatalog) -> LoadedProject:
-    """Текст файла в проект. Ошибки — ``ProjectFileError`` с понятным сообщением."""
+def _equipment_type(
+    raw: dict[str, Any], library: EquipmentLibrary, notes: list[str]
+) -> EquipmentType:
+    """Позиция из файла: та же в библиотеке, добавленная в библиотеку или переименованная."""
+    issues = validate_equipment(**raw)
+    if issues:
+        raise ProjectFileError(f"В файле неверное оборудование: {issues[0].message}")
+    item = EquipmentType(**{**raw, **{k: float(raw[k]) for k in _NUMBERS if k in raw}})
+    names = {i.name: i for i in library.items}
+    if names.get(item.name) == item:
+        return item
+    if item.name in names:
+        renamed = EquipmentType(**{**asdict(item), "name": item.name + FROM_FILE})
+        if names.get(renamed.name) != renamed:
+            library.add_type(renamed)
+        notes.append(
+            f"Оборудование «{item.name}» в библиотеке отличается от сохранённого в проекте: "
+            f"данные из файла добавлены как «{renamed.name}»."
+        )
+        return renamed
+    library.add_type(item)
+    notes.append(f"Оборудование «{item.name}» добавлено в библиотеку из файла.")
+    return item
+
+
+_NUMBERS = ("length_mm", "width_mm", "own_kg", "content_kg")
+
+
+def _equipment(
+    raw: list[dict[str, Any]], contour: Contour, library: EquipmentLibrary, notes: list[str]
+) -> tuple[Equipment, ...]:
+    items = []
+    for entry in raw:
+        kind = _equipment_type(entry["type"], library, notes)
+        centre = tuple(float(v) for v in entry["centre"])
+        try:
+            items.append(place_equipment(contour, kind, centre, rotated=bool(entry["rotated"])))
+        except EquipmentError as error:
+            raise ProjectFileError(f"В файле неверное оборудование: {error}") from error
+    return tuple(items)
+
+
+def load_text(
+    text: str, catalog: ProfileCatalog, library: EquipmentLibrary | None = None
+) -> LoadedProject:
+    """Текст файла в проект. Ошибки — ``ProjectFileError`` с понятным сообщением.
+
+    Недостающие свои профили и позиции оборудования добавляются в ``catalog`` и ``library``.
+    """
+    library = library if library is not None else EquipmentLibrary()
     data = _parse(text)
     try:
         plan, frame, sheets = data["plan"], data["frame"], data["sheets"]
@@ -230,6 +299,7 @@ def load_text(text: str, catalog: ProfileCatalog) -> LoadedProject:
         sections = {
             key: _profile(frame[key], catalog, notes) for key in ("perimeter", "internal", "jumper")
         }
+        equipment = _equipment(data["equipment"], contour, library, notes)
         project = Project(
             contour=contour,
             piles=None if plan["piles"] is None else _points(plan["piles"]),
@@ -246,6 +316,7 @@ def load_text(text: str, catalog: ProfileCatalog) -> LoadedProject:
             sheet_gap_mm=gap,
             sheet_joints=bool(sheets["joints"]),
             zones=zones,
+            equipment=equipment,
         )
         return LoadedProject(project, str(data["object_name"]), data["summary"], notes)
     except ProjectFileError:

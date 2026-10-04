@@ -6,6 +6,13 @@ from dataclasses import dataclass, replace
 
 from pile_frame.contour import Contour, Point
 from pile_frame.design import auto_piles
+from pile_frame.equipment import (
+    Equipment,
+    EquipmentError,
+    EquipmentType,
+    place_equipment,
+    turned,
+)
 from pile_frame.zones import PRESETS, Rect, Zone, ZoneError, place_zone
 
 
@@ -16,6 +23,7 @@ class PlanState:
     contour: Contour | None = None
     piles: tuple[Point, ...] = ()
     zones: tuple[Zone, ...] = ()
+    equipment: tuple[Equipment, ...] = ()
 
 
 class PlanEditor:
@@ -40,6 +48,10 @@ class PlanEditor:
         return self._state.zones
 
     @property
+    def equipment(self) -> tuple[Equipment, ...]:
+        return self._state.equipment
+
+    @property
     def can_undo(self) -> bool:
         return bool(self._undo)
 
@@ -55,17 +67,22 @@ class PlanEditor:
         self._state = state
 
     def load(
-        self, contour: Contour | None, piles: tuple[Point, ...], zones: tuple[Zone, ...] = ()
+        self,
+        contour: Contour | None,
+        piles: tuple[Point, ...],
+        zones: tuple[Zone, ...] = (),
+        equipment: tuple[Equipment, ...] = (),
     ) -> None:
         """Открыть план целиком (из файла или пустой): история отмены начинается заново."""
         self._undo.clear()
         self._redo.clear()
-        self._state = PlanState(contour, tuple(piles), tuple(zones))
+        self._state = PlanState(contour, tuple(piles), tuple(zones), tuple(equipment))
 
     def set_contour(self, contour: Contour) -> None:
         """Задать контур и расставить сваи автоматически; зоны обрезаются по новому контуру."""
         piles = tuple(auto_piles(contour, self.pile_step_mm))
-        self._commit(PlanState(contour, piles, _fit_zones(contour, self.zones)))
+        equipment = tuple(e for e in self.equipment if _fits(contour, e))
+        self._commit(PlanState(contour, piles, _fit_zones(contour, self.zones), equipment))
 
     def add_zone(self, rect: Rect, kind: str) -> None:
         """Нарисовать зону. ``ZoneError`` — зону поставить нельзя, план не меняется."""
@@ -88,6 +105,30 @@ class PlanEditor:
 
     def set_zone_cold_on_board(self, index: int, on_board: bool) -> None:
         self._change_zone(index, cold_on_board=on_board)
+
+    def _set_equipment(self, items: list[Equipment]) -> None:
+        self._commit(replace(self._state, equipment=tuple(items)))
+
+    def add_equipment(self, kind: EquipmentType, centre: Point) -> None:
+        """Поставить оборудование. ``EquipmentError`` — не помещается, план не меняется."""
+        if self.contour is None:
+            raise EquipmentError("Сначала нарисуйте контур плана.")
+        self._set_equipment([*self.equipment, place_equipment(self.contour, kind, centre)])
+
+    def move_equipment(self, index: int, centre: Point) -> None:
+        item = self.equipment[index]
+        moved = place_equipment(self.contour, item.type, centre, rotated=item.rotated)
+        items = list(self.equipment)
+        items[index] = moved
+        self._set_equipment(items)
+
+    def rotate_equipment(self, index: int) -> None:
+        items = list(self.equipment)
+        items[index] = turned(self.contour, items[index])
+        self._set_equipment(items)
+
+    def remove_equipment(self, index: int) -> None:
+        self._set_equipment([e for i, e in enumerate(self.equipment) if i != index])
 
     def remove_zone(self, index: int) -> None:
         zones = [z for i, z in enumerate(self.zones) if i != index]
@@ -136,3 +177,11 @@ def _fit_zones(contour: Contour, zones: tuple[Zone, ...]) -> tuple[Zone, ...]:
             continue
         fitted.append(replace(zone, rect=placed.rect))
     return tuple(fitted)
+
+
+def _fits(contour: Contour, item: Equipment) -> bool:
+    try:
+        place_equipment(contour, item.type, item.centre, rotated=item.rotated)
+    except EquipmentError:
+        return False
+    return True

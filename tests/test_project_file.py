@@ -2,12 +2,14 @@
 
 import json
 import pathlib
+from dataclasses import asdict, replace
 
 import pytest
 
 from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour
 from pile_frame.design import Project, analyze, auto_piles
+from pile_frame.equipment import EquipmentLibrary, EquipmentType, place_equipment
 from pile_frame.materials import STEELS
 from pile_frame.project_file import (
     FORMAT_VERSION,
@@ -249,11 +251,9 @@ def test_zones_are_saved_with_edited_loads_and_cold_room_option():
     assert load_text(save_text(project, "Цех"), ProfileCatalog()).project == project
 
 
-def test_current_format_is_2_and_version_1_files_are_upgraded_without_zones():
-    data = json.loads(save_text(_project(zones=ZONES), "Цех"))
+def test_version_1_files_are_upgraded_without_zones():
     old = json.loads((DATA / "project_v1.karkas").read_text(encoding="utf-8"))
 
-    assert data["format_version"] == 2
     assert "zones" not in old
     assert load_text(json.dumps(old, ensure_ascii=False), ProfileCatalog()).project.zones == ()
 
@@ -289,4 +289,73 @@ def test_project_saved_by_format_version_2_still_opens():
 
     assert json.loads(text)["format_version"] == 2
     assert loaded.project == _project(zones=ZONES)
+    assert summary_note(loaded.summary, analyze(loaded.project)) is None
+
+
+OVEN = EquipmentType("Печь подовая", 1200, 1000, own_kg=400, content_kg=60, note="своя позиция")
+
+
+def _with_equipment():
+    contour = _project().outline
+    mixer = EquipmentLibrary().get("Тестомес спиральный 60 л")
+    return _project(
+        equipment=(
+            place_equipment(contour, mixer, (1000.0, 1000.0)),
+            place_equipment(contour, OVEN, (4500.0, 1000.0), rotated=True),
+        )
+    )
+
+
+def test_equipment_is_saved_with_its_library_entries():
+    library = EquipmentLibrary()  # на другом компьютере своей печи нет
+    loaded = load_text(save_text(_with_equipment(), "Цех"), ProfileCatalog(), library)
+
+    assert loaded.project == _with_equipment()
+    assert library.get("Печь подовая") == OVEN
+    assert loaded.notes == ["Оборудование «Печь подовая» добавлено в библиотеку из файла."]
+
+
+def test_conflicting_equipment_name_keeps_the_file_data_under_a_new_name():
+    library = EquipmentLibrary()
+    library.add(name="Печь подовая", length_mm=1000, width_mm=1000, own_kg=300)
+
+    loaded = load_text(save_text(_with_equipment(), "Цех"), ProfileCatalog(), library)
+
+    assert loaded.project.equipment[1].type.name == "Печь подовая (из файла)"
+    assert loaded.project.equipment[1].type.own_kg == 400
+    assert library.get("Печь подовая (из файла)").own_kg == 400
+    assert library.get("Печь подовая").own_kg == 300
+    assert "отличается" in loaded.notes[0]
+
+
+def test_format_3_adds_equipment_and_older_files_open_without_it():
+    assert json.loads(save_text(_with_equipment(), "Цех"))["format_version"] == 3
+    for name in ("project_v1.karkas", "project_v2.karkas"):
+        text = (DATA / name).read_text(encoding="utf-8")
+        assert load_text(text, ProfileCatalog()).project.equipment == ()
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"centre": [100.0, 100.0]}, "внутри контура"),
+        ({"type": {**asdict(OVEN), "own_kg": -5}}, "больше нуля"),
+    ],
+    ids=["вне контура", "отрицательная масса"],
+)
+def test_broken_equipment_gives_a_clear_message(change, message):
+    data = json.loads(save_text(_with_equipment(), "Цех"))
+    data["equipment"][1].update(change)
+
+    with pytest.raises(ProjectFileError, match=message):
+        load_text(json.dumps(data, ensure_ascii=False), ProfileCatalog())
+
+
+def test_project_saved_by_format_version_3_still_opens():
+    text = (DATA / "project_v3.karkas").read_text(encoding="utf-8")
+
+    loaded = load_text(text, ProfileCatalog())
+
+    assert json.loads(text)["format_version"] == 3
+    assert loaded.project == replace(_with_equipment(), zones=ZONES)
     assert summary_note(loaded.summary, analyze(loaded.project)) is None
