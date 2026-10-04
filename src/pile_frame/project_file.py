@@ -33,8 +33,8 @@ from pile_frame.welds import ELECTRODES
 from pile_frame.zones import PRESETS, Zone, ZoneError, place_zone
 
 APP_ID = "pile-frame-designer"
-#: 1 — исходный формат; 2 — добавлены зоны помещений; 3 — оборудование.
-FORMAT_VERSION = 3
+#: 1 — исходный формат; 2 — зоны помещений; 3 — оборудование; 4 — точечные усиления.
+FORMAT_VERSION = 4
 EXTENSION = ".karkas"
 
 
@@ -51,9 +51,16 @@ def _v2_to_v3(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def _v3_to_v4(data: dict[str, Any]) -> dict[str, Any]:
+    """В формате 3 точечных усилений не было."""
+    data["upgrades"] = []
+    return data
+
+
 MIGRATIONS: dict[int, Callable[[dict[str, Any]], dict[str, Any]]] = {
     1: _v1_to_v2,
     2: _v2_to_v3,
+    3: _v3_to_v4,
 }
 
 
@@ -154,6 +161,10 @@ def save_text(project: Project, object_name: str, design: Design | None = None) 
         "equipment": [
             {"type": asdict(e.type), "centre": list(e.centre), "rotated": e.rotated}
             for e in project.equipment
+        ],
+        "upgrades": [
+            {"start": list(key[0]), "end": list(key[1]), "section": _section(section)}
+            for key, section in project.upgrades
         ],
         "summary": None if design is None else summarize(design),
     }
@@ -300,6 +311,13 @@ def load_text(
             key: _profile(frame[key], catalog, notes) for key in ("perimeter", "internal", "jumper")
         }
         equipment = _equipment(data["equipment"], contour, library, notes)
+        upgrades = tuple(
+            (
+                (_points([u["start"]])[0], _points([u["end"]])[0]),
+                _profile(u["section"], catalog, notes),
+            )
+            for u in data["upgrades"]
+        )
         project = Project(
             contour=contour,
             piles=None if plan["piles"] is None else _points(plan["piles"]),
@@ -317,6 +335,7 @@ def load_text(
             sheet_joints=bool(sheets["joints"]),
             zones=zones,
             equipment=equipment,
+            upgrades=upgrades,
         )
         return LoadedProject(project, str(data["object_name"]), data["summary"], notes)
     except ProjectFileError:

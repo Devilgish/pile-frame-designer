@@ -9,7 +9,7 @@
 import pytest
 
 from pile_frame.boards import BoardSpec
-from pile_frame.design import Project, analyze
+from pile_frame.design import AnalysisError, Project, analyze
 from pile_frame.materials import STEELS
 from pile_frame.sections import TUBE_120x60x4, TUBE_120x120x5
 
@@ -132,3 +132,13 @@ def test_every_overstressed_member_is_reported_not_only_the_governing_one():
 
     assert len(failing) == 2
     assert all(m.length_mm == pytest.approx(6000) for m in failing)
+
+
+@pytest.mark.parametrize("piles", [(), ((0.0, 0.0),)], ids=["без свай", "одна свая"])
+def test_frame_that_is_not_held_by_piles_gives_a_clear_error(piles):
+    project = Project(
+        width_mm=2000, length_mm=2000, pile_step_mm=2000, live_load_kpa=4.0, piles=piles
+    )
+
+    with pytest.raises(AnalysisError, match="не закреплён"):
+        analyze(project)

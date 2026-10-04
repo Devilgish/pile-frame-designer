@@ -8,7 +8,7 @@ import pytest
 
 from pile_frame.boards import BoardSpec
 from pile_frame.contour import Contour
-from pile_frame.design import Project, analyze, auto_piles
+from pile_frame.design import Project, analyze, auto_piles, member_key
 from pile_frame.equipment import EquipmentLibrary, EquipmentType, place_equipment
 from pile_frame.materials import STEELS
 from pile_frame.project_file import (
@@ -18,7 +18,7 @@ from pile_frame.project_file import (
     save_text,
     summary_note,
 )
-from pile_frame.sections import ProfileCatalog, Section, TUBE_120x60x4
+from pile_frame.sections import ProfileCatalog, Section, TUBE_120x60x4, TUBE_120x120x5
 from pile_frame.zones import Zone
 
 L_SHAPE = Contour.from_points(
@@ -329,7 +329,6 @@ def test_conflicting_equipment_name_keeps_the_file_data_under_a_new_name():
 
 
 def test_format_3_adds_equipment_and_older_files_open_without_it():
-    assert json.loads(save_text(_with_equipment(), "Цех"))["format_version"] == 3
     for name in ("project_v1.karkas", "project_v2.karkas"):
         text = (DATA / name).read_text(encoding="utf-8")
         assert load_text(text, ProfileCatalog()).project.equipment == ()
@@ -359,3 +358,17 @@ def test_project_saved_by_format_version_3_still_opens():
     assert json.loads(text)["format_version"] == 3
     assert loaded.project == replace(_with_equipment(), zones=ZONES)
     assert summary_note(loaded.summary, analyze(loaded.project)) is None
+
+
+def test_point_upgrades_are_saved_in_format_4_and_older_files_have_none():
+    project = _project()
+    beam = next(m for m in analyze(project).members if m.kind == "beam")
+    upgraded = replace(project, upgrades=((member_key(beam), TUBE_120x120x5),))
+
+    text = save_text(upgraded, "Цех")
+    loaded = load_text(text, ProfileCatalog())
+
+    assert json.loads(text)["format_version"] == 4
+    assert loaded.project == upgraded
+    old = (DATA / "project_v3.karkas").read_text(encoding="utf-8")
+    assert load_text(old, ProfileCatalog()).project.upgrades == ()

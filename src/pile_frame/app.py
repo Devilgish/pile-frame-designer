@@ -49,13 +49,15 @@ from shapely.geometry import box
 
 from pile_frame.boards import GOST_FORMATS_MM, BoardSpec, validate_board
 from pile_frame.contour import Contour, ContourError, Point
-from pile_frame.design import Design, Project, analyze
+from pile_frame.design import AnalysisError, Design, Project, analyze
 from pile_frame.editor import PlanEditor
 from pile_frame.equipment import Equipment, EquipmentError, EquipmentLibrary
 from pile_frame.equipment_panel import EquipmentPanel, LibraryDialog
 from pile_frame.inputs import NumberField, ProfilesDialog
 from pile_frame.issues import Issue, errors
 from pile_frame.materials import C245, STEELS
+from pile_frame.optimization_dialog import OptimizationDialog
+from pile_frame.optimizer import Variant
 from pile_frame.pdf import write_pdf
 from pile_frame.project_file import (
     EXTENSION,
@@ -743,6 +745,9 @@ class MainWindow(QMainWindow):
         self.current_file: Path | None = None
         self.object_name = DEFAULT_OBJECT
         self._jumper_section = TUBE_40x40x3
+        #: Точечные усиления из применённого варианта оптимизации и параметры до него.
+        self._upgrades: tuple = ()
+        self._before_variant: Project | None = None
         #: Текст файла для текущего состояния и для сохранённого: различие — несохранённые правки.
         self._snapshot: str | None = None
         self._saved_snapshot: str | None = None
@@ -949,6 +954,12 @@ class MainWindow(QMainWindow):
         self.save_as_action.triggered.connect(self._save_as)
         for action in (self.save_action, self.save_as_action):
             action.setEnabled(False)
+        self.optimize_action = QAction("Оптимизация по массе металла…", self)
+        self.optimize_action.setEnabled(False)
+        self.optimize_action.triggered.connect(self._open_optimization)
+        self.undo_variant_action = QAction("Отменить вариант оптимизации", self)
+        self.undo_variant_action.setEnabled(False)
+        self.undo_variant_action.triggered.connect(self._undo_variant)
         toolbar.addAction(self.undo_action)
         toolbar.addAction(self.redo_action)
         toolbar.addSeparator()
@@ -985,6 +996,9 @@ class MainWindow(QMainWindow):
         edit.addAction(self.redo_action)
         data = self.menuBar().addMenu("Данные")
         data.addAction("Профили…", self._open_profiles)
+        data.addSeparator()
+        data.addAction(self.optimize_action)
+        data.addAction(self.undo_variant_action)
         view = self.menuBar().addMenu("Вид")
         theme_menu = view.addMenu("Тема")
         self._theme_actions = QActionGroup(self)
@@ -1099,14 +1113,7 @@ class MainWindow(QMainWindow):
             return  # в исходных данных ошибка: последний результат остаётся на экране
         contour = self.editor.contour
         if contour is None or not self.editor.piles:
-            self.plan.show_design(None)
-            self.results.show_design(None)
-            self.last_design = None
-            self.last_project = None
-            self._set_has_result(False)
-            self.result_card.clear()
-            self._snapshot = None
-            self._update_title()
+            self._show_no_result()
             return
         project = Project(
             contour=contour,
@@ -1116,6 +1123,7 @@ class MainWindow(QMainWindow):
             perimeter_section=self.catalog.get(self.perimeter_profile.currentText()),
             internal_section=self.catalog.get(self.internal_profile.currentText()),
             jumper_section=self._jumper_section,
+            upgrades=self._upgrades,
             zones=self.editor.zones,
             equipment=self.editor.equipment,
             steel=STEELS[self.steel.currentText()],
@@ -1125,7 +1133,13 @@ class MainWindow(QMainWindow):
             sheet_offset_mm=sheets[0],
             sheet_gap_mm=sheets[1],
         )
-        design = analyze(project)
+        try:
+            design = analyze(project)
+        except AnalysisError as error:
+            # Схема изменяемая (например, одна свая): причина — в строке состояния.
+            self._show_no_result()
+            self._message.setText(str(error))
+            return
         self.last_project, self.last_design = project, design
         self._set_has_result(True)
         self._snapshot = save_text(project, self.object_name)
@@ -1166,7 +1180,12 @@ class MainWindow(QMainWindow):
     # --- файл проекта ------------------------------------------------------------------
 
     def _set_has_result(self, value: bool) -> None:
-        for action in (self.report_action, self.save_action, self.save_as_action):
+        for action in (
+            self.report_action,
+            self.save_action,
+            self.save_as_action,
+            self.optimize_action,
+        ):
             action.setEnabled(value)
 
     def _update_title(self) -> None:
@@ -1280,10 +1299,62 @@ class MainWindow(QMainWindow):
         self._message.setText(f"Открыт проект: {path}")
         return True
 
+    # --- оптимизация --------------------------------------------------------------------
+
+    def make_optimization_dialog(self, step_mm: float = 250.0) -> OptimizationDialog:
+        """Диалог оптимизации текущего проекта; профили — из справочника."""
+        return OptimizationDialog(
+            self.last_project,
+            self.last_design,
+            tuple(self.catalog.sections),
+            self._apply_variant,
+            step_mm=step_mm,
+            parent=self,
+        )
+
+    def _open_optimization(self) -> None:
+        if self.last_project is None:
+            return
+        dialog = self.make_optimization_dialog()
+        dialog.start()
+        dialog.exec()
+
+    def _apply_variant(self, variant: Variant) -> None:
+        """Применить вариант одним действием; «Отменить вариант» вернёт прежние параметры."""
+        before_mass = self.last_design.steel_mass_kg if self.last_design else 0.0
+        self._before_variant = self.last_project
+        self._apply_inputs(variant.project)
+        self._recalculate()
+        self.undo_variant_action.setEnabled(True)
+        self._message.setText(
+            f"Применён вариант: {', '.join(variant.changes)}; масса металла "
+            f"{_fmt(variant.mass_kg)} кг вместо {_fmt(before_mass)} кг."
+        )
+
+    def _undo_variant(self) -> None:
+        if self._before_variant is None:
+            return
+        self._apply_inputs(self._before_variant)
+        self._before_variant = None
+        self.undo_variant_action.setEnabled(False)
+        self._recalculate()
+        self._message.setText("Вариант оптимизации отменён.")
+
     def _apply_project(self, project: Project | None) -> None:
-        """Перенести исходные данные в поля, не пересчитывая и не переставляя сваи."""
-        defaults = Project(pile_step_mm=2000, live_load_kpa=4.0)
-        source = project or defaults
+        """Перенести исходные данные и план в окно; история правок плана начинается заново."""
+        self._apply_inputs(project or Project(pile_step_mm=2000, live_load_kpa=4.0))
+        self._before_variant = None
+        self.undo_variant_action.setEnabled(False)
+        if project is None:
+            self.editor.load(None, ())
+        else:
+            self.editor.load(
+                project.outline, tuple(project.piles or ()), project.zones, project.equipment
+            )
+        self.plan.select_member(None)
+
+    def _apply_inputs(self, source: Project) -> None:
+        """Перенести параметры (не план) в поля, не пересчитывая и не переставляя сваи."""
         widgets = [
             self.pile_step,
             self.live_load,
@@ -1326,14 +1397,8 @@ class MainWindow(QMainWindow):
         for widget in widgets:
             widget.blockSignals(False)
         self._jumper_section = source.jumper_section
+        self._upgrades = source.upgrades
         self.editor.pile_step_mm = source.pile_step_mm
-        if project is None:
-            self.editor.load(None, ())
-        else:
-            self.editor.load(
-                project.outline, tuple(project.piles or ()), project.zones, project.equipment
-            )
-        self.plan.select_member(None)
 
     def _recent(self) -> list[str]:
         value = _settings().value("recent", [])
@@ -1379,6 +1444,16 @@ class MainWindow(QMainWindow):
 
     def status_message(self) -> str:
         return self._message.text()
+
+    def _show_no_result(self) -> None:
+        self.plan.show_design(None)
+        self.results.show_design(None)
+        self.last_design = None
+        self.last_project = None
+        self._set_has_result(False)
+        self.result_card.clear()
+        self._snapshot = None
+        self._update_title()
 
     def build_report(self, meta: ReportMeta) -> Report:
         """Расчётная записка по текущему результату."""

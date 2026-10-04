@@ -16,6 +16,8 @@ from scipy import sparse
 from scipy.sparse.linalg import splu
 
 TOLERANCE_MM = 1e-6
+#: Допустимая относительная невязка решения; больше — система вырождена.
+RESIDUAL_TOLERANCE = 1e-6
 #: Узлы и веса квадратуры Гаусса: точна для нагрузки, линейной по длине участка.
 _GAUSS_POINTS, _GAUSS_WEIGHTS = np.polynomial.legendre.leggauss(6)
 
@@ -147,8 +149,10 @@ class Grillage:
                 solution = splu(reduced).solve(loads[free])
             except RuntimeError as error:  # «matrix is exactly singular»
                 raise np.linalg.LinAlgError(str(error)) from error
-            if not np.all(np.isfinite(solution)):
-                raise np.linalg.LinAlgError("Система вырождена.")
+            # Численно вырожденная система (схема изменяемая) решается без ошибки, но с невязкой.
+            residual = np.linalg.norm(reduced @ solution - loads[free])
+            if residual > RESIDUAL_TOLERANCE * max(np.linalg.norm(loads[free]), 1.0):
+                raise np.linalg.LinAlgError("Система вырождена: схема изменяемая.")
             displacements[free] = solution
         return GrillageResult(self, displacements)
 

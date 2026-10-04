@@ -679,3 +679,79 @@ def test_turn_that_does_not_fit_is_explained_and_library_errors_are_shown(qtbot)
     qtbot.addWidget(dialog)
     dialog.add_button.click()  # пустая форма
     assert "название" in dialog.issues.text()
+
+
+def _optimized(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _drag(window.plan, (0, 0), (4000, 2500))
+    dialog = window.make_optimization_dialog(step_mm=500)
+    qtbot.addWidget(dialog)
+    dialog.start()
+    qtbot.waitUntil(lambda: dialog.done, timeout=60000)
+    return window, dialog
+
+
+def test_optimization_runs_in_the_background_and_lists_passing_variants(qtbot):
+    window, dialog = _optimized(qtbot)
+
+    assert dialog.table.rowCount() == len(dialog.variants) > 0
+    assert dialog.progress.value() == dialog.progress.maximum()
+    for variant in dialog.variants:
+        assert variant.design.failing_members() == []
+    headers = [
+        dialog.table.horizontalHeaderItem(c).text() for c in range(dialog.table.columnCount())
+    ]
+    assert headers[:3] == ["Масса, кг", "Легче текущего, кг", "Листы"]
+    assert "Отходы ЦСП, м²" in headers and "Что изменено" in headers
+    dialog.table.selectRow(0)
+    assert "кг" in dialog.explanation.toPlainText()
+
+
+def test_chosen_variant_is_applied_in_one_step_and_can_be_undone(qtbot):
+    window, dialog = _optimized(qtbot)
+    before = window.last_project
+    variant = dialog.variants[0]
+
+    dialog.table.selectRow(0)
+    dialog.apply_button.click()
+
+    applied = window.last_project
+    assert applied.sheet_long_side == variant.project.sheet_long_side
+    assert applied.sheet_offset_mm == variant.project.sheet_offset_mm
+    assert applied.perimeter_section == variant.project.perimeter_section
+    assert window.last_design.steel_mass_kg == pytest.approx(variant.mass_kg)
+    assert window.undo_variant_action.isEnabled()
+
+    window.undo_variant_action.trigger()
+
+    assert window.last_project == before
+    assert not window.undo_variant_action.isEnabled()
+
+
+def test_optimization_can_be_cancelled(qtbot):
+    window = _window_with_rectangle(qtbot)
+    dialog = window.make_optimization_dialog(step_mm=250)
+    qtbot.addWidget(dialog)
+
+    dialog.start()
+    dialog.cancel_button.click()
+    qtbot.waitUntil(lambda: dialog.done, timeout=60000)
+
+    assert dialog.cancelled
+    assert "Остановлено" in dialog.status.text()
+
+
+def test_frame_on_a_single_pile_shows_the_reason_instead_of_a_result(qtbot):
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.show()
+    _drag(window.plan, (0, 0), (2000, 2000))  # четыре угловые сваи
+    window.editor.load(window.editor.contour, ((0.0, 0.0),))
+
+    window._recalculate()
+
+    assert window.last_design is None
+    assert "не закреплён" in window.status_message()
+    assert not window.report_action.isEnabled()

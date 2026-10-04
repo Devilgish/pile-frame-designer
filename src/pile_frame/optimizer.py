@@ -16,7 +16,15 @@ import math
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
-from pile_frame.design import Design, Frame, Project, analyze, frame, member_key
+from pile_frame.design import (
+    AnalysisError,
+    Design,
+    Frame,
+    Project,
+    analyze,
+    frame,
+    member_key,
+)
 from pile_frame.sections import Section
 
 #: Сколько раз подряд усиливать непроходящие балки, прежде чем отказаться от варианта.
@@ -105,7 +113,10 @@ def _evaluate(project: Project, sections: list[Section]) -> Design | None:
     """Расчёт с точечными усилениями; ``None`` — вариант не удаётся сделать проходящим."""
     upgrades = dict(project.upgrades)
     for _ in range(MAX_UPGRADE_ROUNDS):
-        design = analyze(replace(project, upgrades=tuple(upgrades.items())))
+        try:
+            design = analyze(replace(project, upgrades=tuple(upgrades.items())))
+        except AnalysisError:
+            return None
         if _passes(design):
             return design
         if design.unsupported_members or any(w.check.utilization > 1 for w in design.welds):
