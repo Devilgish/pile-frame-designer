@@ -45,6 +45,8 @@ FAIL = colors.HexColor("#B91C1C")
 WARNING = colors.HexColor("#B45309")
 JUMPER = colors.HexColor("#0F766E")
 ZONE = colors.HexColor("#7C3AED")
+EQUIPMENT = colors.HexColor("#BE185D")
+EQUIPMENT_FILL = colors.Color(0.745, 0.094, 0.365, alpha=0.18)
 ZONE_FILL = colors.Color(0.486, 0.227, 0.929, alpha=0.08)
 
 
@@ -235,6 +237,19 @@ def _plan(figure: rp.PlanFigure, styles) -> Drawing:
         if warn:
             zone.strokeDashArray = [2, 1.5]
         drawing.add(zone)
+    for rect, _ in figure.equipment:
+        (x0, y0), (x1, y1) = at(rect[:2]), at(rect[2:])
+        drawing.add(
+            Rect(
+                min(x0, x1),
+                min(y0, y1),
+                abs(x1 - x0),
+                abs(y1 - y0),
+                fillColor=EQUIPMENT_FILL,
+                strokeColor=EQUIPMENT,
+                strokeWidth=0.6,
+            )
+        )
     outline = [c for p in [*figure.contour, figure.contour[0]] for c in at(p)]
     drawing.add(PolyLine(outline, strokeColor=RULE, strokeWidth=0.6))
     stroke = {"perimeter": 1.6, "beam": 1.0, "jumper": 0.5}
@@ -265,6 +280,19 @@ def _plan(figure: rp.PlanFigure, styles) -> Drawing:
         x, y = at(point)
         drawing.add(Circle(x, y, 1.6, fillColor=WARNING, strokeColor=None))
         drawing.add(String(x + 2, y - font - 1.5, label, fontName=FONT_BOLD, fontSize=font + 0.6))
+    # Подписи оборудования — короткие, у левого нижнего угла габарита.
+    for rect, name in figure.equipment:
+        (x0, y0), (x1, y1) = at(rect[:2]), at(rect[2:])
+        drawing.add(
+            String(
+                min(x0, x1) + 1,
+                min(y0, y1) + 1,
+                name.split()[0],
+                fontName=FONT,
+                fontSize=4.5,
+                fillColor=EQUIPMENT,
+            )
+        )
     # Подписи зон — поверх балок и свай, на белой подложке.
     for rect, label, _ in figure.zones:
         (x0, y0), (x1, y1) = at(rect[:2]), at(rect[2:])

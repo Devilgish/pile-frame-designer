@@ -38,6 +38,7 @@ NON_TEXT_PAIRS = [
     ("member_internal", "plan_background"),
     ("member_jumper", "plan_background"),
     ("zone", "plan_background"),
+    ("equipment", "plan_background"),
     ("pile", "plan_background"),
     ("fail", "plan_background"),
     ("outline", "plan_background"),

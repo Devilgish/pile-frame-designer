@@ -6,6 +6,7 @@ import pytest
 
 from pile_frame import assumptions
 from pile_frame.design import Project, analyze
+from pile_frame.equipment import EquipmentLibrary, place_equipment
 from pile_frame.report import Heading, PlanFigure, ReportMeta, build_report
 from pile_frame.zones import Zone
 
@@ -271,3 +272,43 @@ def test_input_data_name_the_live_load_outside_zones_and_count_the_zones():
 
     assert rows["Временная нагрузка вне зон"] == "1,50 кПа"
     assert rows["Зон помещений"] == "2"
+
+
+def _equipped_report():
+    contour = Project(width_mm=6000, length_mm=4000, pile_step_mm=2000, live_load_kpa=1.5).outline
+    mixer = EquipmentLibrary().get("Тестомес спиральный 60 л")
+    project = Project(
+        width_mm=6000,
+        length_mm=4000,
+        pile_step_mm=2000,
+        live_load_kpa=1.5,
+        equipment=(
+            place_equipment(contour, mixer, (1000, 1000)),
+            place_equipment(contour, mixer, (3000, 1000), rotated=True),
+        ),
+    )
+    return build_report(project, analyze(project), META)
+
+
+def test_equipment_is_a_separate_line_of_the_loads_table():
+    # Два тестомеса: нормативно 2·(200 + 50)·9,81 = 4,91 кН; расчётно 2·(1,05·200 + 1,2·50)·9,81
+    # = 5,30 кН (СП 20.13330.2016, табл. 8.2).
+    rows = _table(_equipped_report(), "Нагрузки").rows
+
+    row = next(r for r in rows if r[0].startswith("Оборудование"))
+    assert row[:4] == (
+        "Оборудование «Тестомес спиральный 60 л» × 2",
+        "4,91 кН",
+        "1,05/1,2",
+        "5,30 кН",
+    )
+    assert "табл. 8.2" in row[4] and "паспорт" in row[4]
+
+
+def test_equipment_is_in_the_summary_and_on_the_plan():
+    report = _equipped_report()
+    figure = next(b for s in report.sections for b in s.blocks if isinstance(b, PlanFigure))
+
+    assert "Оборудование: 2 шт., расчётный вес 5,30 кН." in report.summary()
+    assert len(figure.equipment) == 2
+    assert figure.equipment[1][0] == (2775.0, 600.0, 3225.0, 1400.0)

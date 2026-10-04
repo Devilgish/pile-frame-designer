@@ -32,6 +32,7 @@ class Theme:
     member_internal: str
     member_jumper: str
     zone: str
+    equipment: str
     pile: str
     sheet_fill: str
     sheet_cut: str
@@ -59,6 +60,7 @@ LIGHT = Theme(
     member_internal="#475569",
     member_jumper="#0F766E",
     zone="#7C3AED",
+    equipment="#BE185D",
     pile="#C2410C",
     sheet_fill="#E6EDF6",
     sheet_cut="#94A3B8",
@@ -86,6 +88,7 @@ DARK = Theme(
     member_internal="#94A3B8",
     member_jumper="#2DD4BF",
     zone="#A78BFA",
+    equipment="#F472B6",
     pile="#FB923C",
     sheet_fill="#1B2940",
     sheet_cut="#52627A",

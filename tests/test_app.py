@@ -11,7 +11,7 @@ from PySide6.QtGui import QPalette
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
-from pile_frame.app import MainWindow
+from pile_frame.app import MainWindow, _settings
 from pile_frame.report import ReportMeta
 from pile_frame.report_dialog import ReportDialog
 from pile_frame.status import Status
@@ -572,3 +572,110 @@ def test_zones_are_saved_and_reopened(qtbot, tmp_path):
 
     assert window.last_project.zones == (Zone("pastry", (2000.0, 0.0, 4000.0, 2000.0), 2.0),)
     assert len(window.zones_panel.rows) == 1
+
+
+def _select_equipment(window, name):
+    combo = window.equipment_panel.new_type
+    combo.setCurrentIndex(combo.findText(name))
+
+
+def _window_with_mixer(qtbot):
+    window = _window_with_rectangle(qtbot)
+    window.set_tool("equipment")
+    _select_equipment(window, "Тестомес спиральный 60 л")
+    _click(window.plan, (1000, 1000))
+    return window
+
+
+def test_equipment_tool_places_the_chosen_item_and_shows_its_load_separately(qtbot):
+    window = _window_with_mixer(qtbot)
+
+    (item,) = window.last_project.equipment
+    assert item.type.name == "Тестомес спиральный 60 л" and item.centre == (1000.0, 1000.0)
+    # (1,05·200 + 1,2·50)·9,81 = 2,65 кН — отдельной строкой в карточке.
+    assert window.result_card.value("Оборудование") == "1 шт., расчётная 2,65 кН"
+    note = window.equipment_panel.note.text()
+    assert "внутри контура" in note and "зон" in note
+
+
+def test_equipment_is_dragged_turned_with_r_and_removed_with_right_click(qtbot):
+    window = _window_with_mixer(qtbot)
+
+    _drag(window.plan, (1000, 1000), (3000, 2000))
+    assert window.last_project.equipment[0].centre == (3000.0, 2000.0)
+    QTest.keyClick(window.plan, Qt.Key.Key_R)
+    assert window.last_project.equipment[0].rotated
+    QTest.mouseClick(
+        window.plan.viewport(),
+        Qt.MouseButton.RightButton,
+        pos=window.plan.mapFromScene(QPointF(3000, 2000)),
+    )
+    assert window.last_project.equipment == ()
+
+
+def test_equipment_outside_the_contour_is_refused_with_a_reason(qtbot):
+    window = _window_with_mixer(qtbot)
+
+    _click(window.plan, (5900, 2000))
+
+    assert len(window.last_project.equipment) == 1
+    assert "внутри контура" in window.status_message()
+
+
+def test_equipment_panel_turns_and_removes_items(qtbot):
+    window = _window_with_mixer(qtbot)
+    row = window.equipment_panel.rows[0]
+
+    row.rotate.click()
+    assert window.last_project.equipment[0].rotated
+    window.equipment_panel.rows[0].remove.click()
+    assert window.last_project.equipment == ()
+
+
+def test_own_equipment_is_added_to_the_library_and_remembered(qtbot):
+    window = _window_with_rectangle(qtbot)
+    dialog = window.make_library_dialog()
+    qtbot.addWidget(dialog)
+
+    dialog.fields["name"].setText("Печь подовая")
+    for key, value in (
+        ("length_mm", 1200),
+        ("width_mm", 1000),
+        ("own_kg", 400),
+        ("content_kg", 60),
+    ):
+        dialog.fields[key].setValue(value)
+    dialog.add_button.click()
+
+    assert window.equipment_library.get("Печь подовая").own_kg == 400
+    window.equipment_panel.refresh_library()
+    assert window.equipment_panel.new_type.findText("Печь подовая") >= 0
+    assert "Печь подовая" in str(_settings().value("equipment"))
+
+
+def test_equipment_is_saved_and_reopened(qtbot, tmp_path):
+    window = _window_with_mixer(qtbot)
+    path = tmp_path / "оборудование.karkas"
+    window.save_to(path)
+    window.new_project()
+
+    window.open_file(path)
+
+    assert window.last_project.equipment[0].centre == (1000.0, 1000.0)
+    assert len(window.equipment_panel.rows) == 1
+
+
+def test_turn_that_does_not_fit_is_explained_and_library_errors_are_shown(qtbot):
+    window = _window_with_rectangle(qtbot)
+    window.set_tool("equipment")
+    _select_equipment(window, "Тестораскаточная машина")
+    _click(window.plan, (3000, 500))  # 2000 × 800 у нижней стены — развернуть некуда
+
+    window.equipment_panel.rows[0].rotate.click()
+
+    assert not window.last_project.equipment[0].rotated
+    assert "внутри контура" in window.status_message()
+    dialog = window.make_library_dialog()
+    qtbot.addWidget(dialog)
+    dialog.add_button.click()  # пустая форма
+    assert "название" in dialog.issues.text()

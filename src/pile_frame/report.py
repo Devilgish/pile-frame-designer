@@ -35,6 +35,7 @@ from pile_frame.board_check import (
     load_radius_mm,
 )
 from pile_frame.design import Design, Member, Project
+from pile_frame.equipment import GAMMA_F_CONTENT, GAMMA_F_EQUIPMENT
 from pile_frame.materials import STEEL_E_MPA
 from pile_frame.stability import WEB_SLENDERNESS_LIMIT
 from pile_frame.status import design_status
@@ -121,6 +122,8 @@ class PlanFigure:
     bearing: tuple[tuple[tuple[float, float], tuple[float, float]], ...]
     #: Зоны: прямоугольник, подпись «назначение, нагрузка», нужна ли пометка-предупреждение.
     zones: tuple[tuple[tuple[float, float, float, float], str, bool], ...] = ()
+    #: Оборудование: габарит и подпись.
+    equipment: tuple[tuple[tuple[float, float, float, float], str], ...] = ()
 
 
 @dataclass
@@ -422,6 +425,19 @@ def _loads_section(project: Project, design: Design) -> Section:
                 PRESETS[zone.kind].source,
             )
         )
+    groups: dict[str, list] = {}
+    for item in project.equipment:
+        groups.setdefault(item.type.name, []).append(item.type)
+    for name, types in groups.items():
+        rows.append(
+            (
+                f"Оборудование «{name}» × {len(types)}",
+                f"{num(sum(t.normative_weight_kn for t in types), 2)} кН",
+                f"{short(GAMMA_F_EQUIPMENT)}/{short(GAMMA_F_CONTENT)}",
+                f"{num(sum(t.design_weight_kn for t in types), 2)} кН",
+                f"{SP20}, табл. 8.2 (собственная масса / загрузка); {types[0].note}",
+            )
+        )
     sections = []
     for kind in KIND_TITLES:
         for member in design.members:
@@ -550,7 +566,7 @@ def _input_section(project: Project, design: Design) -> Section:
     return Section("Исходные данные", [Table("Исходные данные", ("Параметр", "Значение"), rows)])
 
 
-def plan_figure(design: Design, contour, zones=()) -> PlanFigure:
+def plan_figure(design: Design, contour, zones=(), equipment=()) -> PlanFigure:
     failing = {id(m) for m in design.failing_members()}
     members = tuple(
         PlanMember(m.start, m.end, m.kind, tables.member_label(i), id(m) in failing)
@@ -561,7 +577,8 @@ def plan_figure(design: Design, contour, zones=()) -> PlanFigure:
     labelled = tuple(
         (z.rect, f"{z.title}, {num(z.live_load_kpa, 2)} кПа", z.cold_on_board) for z in zones
     )
-    return PlanFigure(tuple(contour.vertices), members, piles, bearing, labelled)
+    items = tuple((e.rect, e.type.name) for e in equipment)
+    return PlanFigure(tuple(contour.vertices), members, piles, bearing, labelled, items)
 
 
 def _scheme_section(project: Project, design: Design) -> Section:
@@ -571,7 +588,7 @@ def _scheme_section(project: Project, design: Design) -> Section:
             Paragraph(assumptions.SIMPLIFICATIONS[0]),
             Paragraph(assumptions.SIMPLIFICATIONS[1]),
             Paragraph(assumptions.SIMPLIFICATIONS[2]),
-            plan_figure(design, project.outline, project.zones),
+            plan_figure(design, project.outline, project.zones, project.equipment),
             Paragraph(
                 "Марки элементов (Б…) и свай (С…) совпадают с таблицами записки и программы. "
                 "Перемычки показаны тонкими линиями, непроходящие элементы — пунктиром, "
@@ -590,7 +607,7 @@ def _limitations_section() -> Section:
     return Section("Что не проверяется и принятые упрощения", blocks)
 
 
-def _summary_section(design: Design) -> Section:
+def _summary_section(design: Design, count: int = 0) -> Section:
     status, label, utilization = design_status(design)
     member = design.governing_member
     failing = len(design.failing_members())
@@ -609,12 +626,16 @@ def _summary_section(design: Design) -> Section:
     if design.electrode_issue:
         lines.append(design.electrode_issue)
     lines += design.remarks
+    if count:
+        lines.append(
+            f"Оборудование: {count} шт., расчётный вес {num(design.equipment_load_kn, 2)} кН."
+        )
     return Section("Итог", [Paragraph(line) for line in lines])
 
 
 def build_report(project: Project, design: Design, meta: ReportMeta) -> Report:
     sections = [
-        _summary_section(design),
+        _summary_section(design, len(project.equipment)),
         _input_section(project, design),
         _loads_section(project, design),
         _scheme_section(project, design),

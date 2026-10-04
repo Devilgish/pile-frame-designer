@@ -13,6 +13,7 @@ from PySide6.QtGui import (
     QBrush,
     QCloseEvent,
     QColor,
+    QFontMetrics,
     QKeyEvent,
     QKeySequence,
     QMouseEvent,
@@ -50,6 +51,8 @@ from pile_frame.boards import GOST_FORMATS_MM, BoardSpec, validate_board
 from pile_frame.contour import Contour, ContourError, Point
 from pile_frame.design import Design, Project, analyze
 from pile_frame.editor import PlanEditor
+from pile_frame.equipment import Equipment, EquipmentError, EquipmentLibrary
+from pile_frame.equipment_panel import EquipmentPanel, LibraryDialog
 from pile_frame.inputs import NumberField, ProfilesDialog
 from pile_frame.issues import Issue, errors
 from pile_frame.materials import C245, STEELS
@@ -85,9 +88,15 @@ SETTINGS_APP = "pile-frame-designer"
 #: Сколько последних файлов показывать в меню «Файл».
 RECENT_LIMIT = 6
 THEME_LABELS = {"system": "Как в системе", "light": "Светлая", "dark": "Тёмная"}
-TOOL_LABELS = {"contour": "Контур", "piles": "Сваи", "zones": "Зоны"}
+TOOL_LABELS = {
+    "contour": "Контур",
+    "piles": "Сваи",
+    "zones": "Зоны",
+    "equipment": "Оборудование",
+}
 #: Прозрачность заливки зоны на плане (0–255): листы и балки под ней остаются видны.
 ZONE_FILL_ALPHA = 36
+EQUIPMENT_FILL_ALPHA = 70
 CUSTOM_FORMAT = "Свой размер"
 
 
@@ -145,6 +154,10 @@ class PlanView(QGraphicsView):
         self._selected: int | None = None
         #: Назначение зоны, которую рисует инструмент «Зоны».
         self.zone_kind = "prep"
+        #: Какую позицию ставит инструмент «Оборудование» (задаёт окно).
+        self.equipment_source = lambda: None
+        self._dragged_equipment: int | None = None
+        self._selected_equipment: int | None = None
         self._redraw()
 
     # --- состояние и отрисовка -------------------------------------------------------
@@ -199,6 +212,7 @@ class PlanView(QGraphicsView):
             if self.show_sheets:
                 self._draw_sheets(self._design)
         self._draw_zones()
+        self._draw_equipment()
         if self._design is not None:
             self._draw_members(self._design)
             self._draw_board_issues(self._design)
@@ -239,6 +253,53 @@ class PlanView(QGraphicsView):
             label.setBrush(QColor(t.text))
             label.setFlag(label.GraphicsItemFlag.ItemIgnoresTransformations)
             label.setPos(x0 + 60, y0 + 60)
+
+    def _draw_equipment(self) -> None:
+        """Оборудование: габарит с заливкой и подпись «название, масса»."""
+        t = self._theme
+        fill = QColor(t.equipment)
+        fill.setAlpha(EQUIPMENT_FILL_ALPHA)
+        for index, item in enumerate(self.editor.equipment):
+            x0, y0, x1, y1 = item.rect
+            if index == self._dragged_equipment and self._press and self._cursor:
+                dx, dy = self._cursor[0] - self._press[0], self._cursor[1] - self._press[1]
+                x0, y0, x1, y1 = x0 + dx, y0 + dy, x1 + dx, y1 + dy
+            selected = index == self._selected_equipment
+            pen = QPen(QColor(t.focus if selected else t.equipment), 0)
+            rect = self._scene.addRect(QRectF(x0, y0, x1 - x0, y1 - y0), pen, fill)
+            mass = item.type.own_kg + item.type.content_kg
+            rect.setToolTip(f"{item.type.name}, {mass:g} кг")
+            text = self._fitting_label(item.type.name, f"{mass:g} кг", x1 - x0)
+            if text:
+                label = self._scene.addSimpleText(text)
+                label.setBrush(QColor(t.text))
+                label.setFlag(label.GraphicsItemFlag.ItemIgnoresTransformations)
+                label.setPos(x0 + 30, y0 + 30)
+
+    def _fitting_label(self, name: str, mass: str, width_mm: float) -> str:
+        """Подпись, которая помещается в габарит на текущем масштабе: имя и масса, масса, ничего."""
+        metrics = QFontMetrics(self.font())
+        width_px = width_mm * self.transform().m11() - 6
+        for text in (f"{name}\n{mass}", mass):
+            if max(metrics.horizontalAdvance(line) for line in text.split("\n")) <= width_px:
+                return text
+        return ""
+
+    def _equipment_at(self, point: Point) -> int | None:
+        for index in reversed(range(len(self.editor.equipment))):
+            x0, y0, x1, y1 = self.editor.equipment[index].rect
+            if x0 <= point[0] <= x1 and y0 <= point[1] <= y1:
+                return index
+        return None
+
+    def _equipment_action(self, action, *args) -> None:
+        try:
+            action(*args)
+        except EquipmentError as error:
+            self.message.emit(str(error))
+            return
+        self.message.emit("")
+        self.edited.emit()
 
     def _draw_sheets(self, design: Design) -> None:
         """Листы: заливка кусков внутри контура, резаные — со штриховкой."""
@@ -353,11 +414,21 @@ class PlanView(QGraphicsView):
                 self.editor.delete_pile(pile)
                 self.edited.emit()
             return
+        if self.tool == "equipment" and event.button() == Qt.MouseButton.RightButton:
+            raw = self.mapToScene(event.position().toPoint())
+            index = self._equipment_at((raw.x(), raw.y()))
+            if index is not None:
+                self._selected_equipment = None
+                self._equipment_action(self.editor.remove_equipment, index)
+            return
         if event.button() != Qt.MouseButton.LeftButton:
             return
         self._press, self._cursor = point, point
         if self.tool == "piles":
             self._dragged_pile = self._pile_at(event)
+        if self.tool == "equipment":
+            raw = self.mapToScene(event.position().toPoint())
+            self._dragged_equipment = self._equipment_at((raw.x(), raw.y()))
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         point = self._snapped(event)
@@ -378,6 +449,8 @@ class PlanView(QGraphicsView):
             self._release_contour(press, point)
         elif self.tool == "zones":
             self._release_zone(press, point)
+        elif self.tool == "equipment":
+            self._release_equipment(press, point)
         else:
             self._release_piles(point)
         self._redraw()
@@ -397,6 +470,23 @@ class PlanView(QGraphicsView):
         elif not self._vertices or point != self._vertices[-1]:
             self._vertices.append(point)
             self.message.emit("Кликайте по вершинам; клик в первую вершину замыкает контур.")
+
+    def _release_equipment(self, press: Point, point: Point) -> None:
+        dragged, self._dragged_equipment = self._dragged_equipment, None
+        if dragged is not None:
+            self._selected_equipment = dragged
+            if point != press:
+                x, y = self.editor.equipment[dragged].centre
+                target = (x + point[0] - press[0], y + point[1] - press[1])
+                self._equipment_action(self.editor.move_equipment, dragged, target)
+            return
+        kind = self.equipment_source()
+        if kind is None:
+            return
+        count = len(self.editor.equipment)
+        self._equipment_action(self.editor.add_equipment, kind, point)
+        if len(self.editor.equipment) > count:
+            self._selected_equipment = count
 
     def _release_zone(self, press: Point, point: Point) -> None:
         self._rectangle = False
@@ -431,6 +521,17 @@ class PlanView(QGraphicsView):
             self.edited.emit()
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        selected = self._selected_equipment
+        if self.tool == "equipment" and selected is not None:
+            if selected >= len(self.editor.equipment):
+                self._selected_equipment = None
+            elif event.key() == Qt.Key.Key_R:
+                self._equipment_action(self.editor.rotate_equipment, selected)
+                return
+            elif event.key() == Qt.Key.Key_Delete:
+                self._selected_equipment = None
+                self._equipment_action(self.editor.remove_equipment, selected)
+                return
         if event.key() == Qt.Key.Key_Escape and self._vertices:
             self._vertices.clear()
             self._redraw()
@@ -462,6 +563,7 @@ class ResultCard(QFrame):
         "Листы",
         "Обрезки",
         "Лист ЦСП",
+        "Оборудование",
         "Замечания",
     )
 
@@ -510,7 +612,10 @@ class ResultCard(QFrame):
         self._theme = theme
         self._refresh_status_style()
 
-    def show_design(self, contour: Contour, design: Design) -> None:
+    def show_design(
+        self, contour: Contour, design: Design, equipment: tuple[Equipment, ...] = ()
+    ) -> None:
+        self._equipment = equipment
         check, member = design.governing_check, design.governing_member
         self._status, self._label, _ = design_status(design)
         v = self._values
@@ -519,6 +624,10 @@ class ResultCard(QFrame):
         v["Габариты"].setText(f"{max(xs) - min(xs):.0f} × {max(ys) - min(ys):.0f} мм")
         v["Площадь"].setText(f"{_fmt(contour.area_mm2 / 1e6)} м²")
         v["Свай"].setText(str(len(design.piles)))
+        count = len(self._equipment)
+        v["Оборудование"].setText(
+            f"{count} шт., расчётная {_fmt(design.equipment_load_kn, 2)} кН" if count else "нет"
+        )
         v["Не проходят"].setText(f"{len(design.failing_members())} из {len(design.members)}")
         kind = "перемычка " if member.kind == "jumper" else ""
         v["Балка"].setText(f"{kind}{member.section.name}, {member.length_mm:.0f} мм")
@@ -621,6 +730,11 @@ class MainWindow(QMainWindow):
         self.editor = PlanEditor(pile_step_mm=self.pile_step.value())
         self.plan = PlanView(self.editor)
         self.zones_panel = ZonesPanel(self.editor)
+        self.equipment_library = EquipmentLibrary.from_json(
+            str(_settings().value("equipment", "[]"))
+        )
+        self.equipment_panel = EquipmentPanel(self.editor, self.equipment_library)
+        self.plan.equipment_source = lambda: self.equipment_panel.selected_type
         self.result_card = ResultCard()
         self.results = ResultsPanel()
         self.last_design: Design | None = None
@@ -703,6 +817,8 @@ class MainWindow(QMainWindow):
         side.addLayout(load_form)
         side.addWidget(_section("Зоны помещений"))
         side.addWidget(self.zones_panel)
+        side.addWidget(_section("Оборудование"))
+        side.addWidget(self.equipment_panel)
         side.addWidget(_section("Каркас"))
         side.addLayout(frame_form)
         side.addWidget(_section("Пол: ЦСП, ГОСТ 26816-2016"))
@@ -738,6 +854,11 @@ class MainWindow(QMainWindow):
 
         self.plan.edited.connect(self._recalculate)
         self.zones_panel.edited.connect(self._recalculate)
+        self.equipment_panel.edited.connect(self._recalculate)
+        self.equipment_panel.message.connect(self._message.setText)
+        self.equipment_panel.library_button.clicked.connect(
+            lambda: self.make_library_dialog().exec()
+        )
         self.zones_panel.new_kind.currentIndexChanged.connect(
             lambda _: setattr(self.plan, "zone_kind", self.zones_panel.new_kind.currentData())
         )
@@ -875,7 +996,7 @@ class MainWindow(QMainWindow):
             theme_menu.addAction(action)
 
     def set_tool(self, tool: str) -> None:
-        """Выбрать инструмент: «contour», «piles» или «zones»."""
+        """Выбрать инструмент: «contour», «piles», «zones» или «equipment»."""
         self.plan.set_tool(tool)
         for action in self._tool_actions.actions():
             action.setChecked(action.data() == tool)
@@ -884,6 +1005,8 @@ class MainWindow(QMainWindow):
             "piles": "Клик — добавить сваю, перетащить — сдвинуть, "
             "правый клик или Delete — удалить.",
             "zones": "Протяните прямоугольник зоны; назначение — в панели «Зоны помещений».",
+            "equipment": "Клик — поставить, перетащить — сдвинуть, R — повернуть, "
+            "правый клик — удалить.",
         }
         self._message.setText(hints[tool])
 
@@ -970,6 +1093,7 @@ class MainWindow(QMainWindow):
         self.undo_action.setEnabled(self.editor.can_undo)
         self.redo_action.setEnabled(self.editor.can_redo)
         self.zones_panel.refresh(self.editor.zones)
+        self.equipment_panel.refresh(self.editor.equipment)
         board, sheets = self._board(), self._sheet_params()
         if board is None or sheets is None:
             return  # в исходных данных ошибка: последний результат остаётся на экране
@@ -993,6 +1117,7 @@ class MainWindow(QMainWindow):
             internal_section=self.catalog.get(self.internal_profile.currentText()),
             jumper_section=self._jumper_section,
             zones=self.editor.zones,
+            equipment=self.editor.equipment,
             steel=STEELS[self.steel.currentText()],
             electrode=self.electrode.currentText(),
             board=board,
@@ -1014,7 +1139,7 @@ class MainWindow(QMainWindow):
             self.electrode_issue.hide()
         self.plan.show_design(design)
         self.results.show_design(design)
-        self.result_card.show_design(contour, design)
+        self.result_card.show_design(contour, design, self.editor.equipment)
 
     def _export_report(self) -> None:
         """Спросить титул и файл, сверстать записку по текущему результату."""
@@ -1126,7 +1251,9 @@ class MainWindow(QMainWindow):
         """Открыть проект. Ошибки показываются сообщением, текущий проект не меняется."""
         path = Path(path)
         try:
-            loaded = load_text(path.read_text(encoding="utf-8"), self.catalog)
+            loaded = load_text(
+                path.read_text(encoding="utf-8"), self.catalog, self.equipment_library
+            )
         except (OSError, UnicodeDecodeError) as error:
             reason = getattr(error, "strerror", None) or "файл не читается как текст"
             QMessageBox.warning(self, "Не удалось открыть проект", f"{path}\n{reason}")
@@ -1136,6 +1263,7 @@ class MainWindow(QMainWindow):
             return False
         _settings().setValue("profiles", self.catalog.to_json())
         self._fill_profiles()
+        self._save_library()
         self._apply_project(loaded.project)
         self.current_file = path
         self.object_name = loaded.object_name
@@ -1202,7 +1330,9 @@ class MainWindow(QMainWindow):
         if project is None:
             self.editor.load(None, ())
         else:
-            self.editor.load(project.outline, tuple(project.piles or ()), project.zones)
+            self.editor.load(
+                project.outline, tuple(project.piles or ()), project.zones, project.equipment
+            )
         self.plan.select_member(None)
 
     def _recent(self) -> list[str]:
@@ -1238,6 +1368,14 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
+
+    def _save_library(self) -> None:
+        _settings().setValue("equipment", self.equipment_library.to_json())
+        self.equipment_panel.refresh_library()
+
+    def make_library_dialog(self) -> LibraryDialog:
+        """Диалог библиотеки оборудования; добавленное сразу сохраняется в настройках."""
+        return LibraryDialog(self.equipment_library, self._save_library, self)
 
     def status_message(self) -> str:
         return self._message.text()
